@@ -12,9 +12,14 @@ import fs from 'fs';
 import path from 'path';
 
 const REQUEST_TIMEOUT_MS = 3000;
+const AUTH_TOKEN_TTL_MS = 60_000; // Cache auth token for 60s
 const AUTH_TOKEN_PATH =
   process.env.MC_AUTH_TOKEN_PATH ||
   path.join(process.env.HOME || '~', '.secrets', 'mc-auth-token');
+
+// Cached auth token + expiry — avoids per-request disk read at heartbeat rate.
+let _cachedToken: string | null = null;
+let _cachedTokenExpiry = 0;
 
 export interface InboxItem {
   _id: string;
@@ -52,13 +57,26 @@ const SKIP_LABELS = new Set([
 ]);
 
 function readAuthToken(): string {
+  const now = Date.now();
+  if (_cachedToken && now < _cachedTokenExpiry) {
+    return _cachedToken;
+  }
   try {
-    return fs.readFileSync(AUTH_TOKEN_PATH, 'utf-8').trim();
+    const token = fs.readFileSync(AUTH_TOKEN_PATH, 'utf-8').trim();
+    _cachedToken = token;
+    _cachedTokenExpiry = now + AUTH_TOKEN_TTL_MS;
+    return token;
   } catch {
     throw new Error(
       `Cannot read auth token from ${AUTH_TOKEN_PATH}. Create it with: echo "<token>" > ${AUTH_TOKEN_PATH}`,
     );
   }
+}
+
+/** Force-reload the cached token on next call. Used by tests / rotation. */
+export function invalidateTokenCache(): void {
+  _cachedToken = null;
+  _cachedTokenExpiry = 0;
 }
 
 async function fetchWithTimeout(
@@ -130,6 +148,39 @@ export async function completeItem(
     headers: authHeaders(),
     body: JSON.stringify({ inboxId, agentId, result }),
   });
+}
+
+export interface CreateItemRequest {
+  agent: string;
+  project: string;
+  clan: string;
+  title: string;
+  body: string;
+  labels?: string[];
+  targetAgent?: string;
+}
+
+export interface CreateItemResponse {
+  inboxId: string;
+}
+
+/**
+ * Create a new inbox item. Used by agents to hand work off to each other
+ * or to file mortal-inbox requests for Stevie.
+ */
+export async function createItem(
+  convexUrl: string,
+  req: CreateItemRequest,
+): Promise<CreateItemResponse> {
+  const response = await fetchWithTimeout(`${convexUrl}/api/inbox/create`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(req),
+  });
+  if (!response.ok) {
+    throw new Error(`Inbox create failed: ${response.status} ${response.statusText}`);
+  }
+  return (await response.json()) as CreateItemResponse;
 }
 
 /**
