@@ -228,33 +228,94 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 // learning-sync, learning-verifier
 // ---------------------------------------------------------------------------
 
+// Critical rules included in the condensed STANDING_ORDERS injection
+// (turns after the first). Full orders load on turn 1 to save tokens thereafter.
+const CONDENSED_RULE_PREFIXES = ['Rule 1', 'Rule 2', 'Rule 8', 'Rule 10', 'Rule 15'];
+
+let _fullStandingOrders = '';
+let _condensedStandingOrders = '';
+let _standingOrdersLoaded = false;
+let _seenSessions = new Set<string>();
+
+function loadStandingOrders(): void {
+  if (_standingOrdersLoaded) return;
+  _standingOrdersLoaded = true;
+
+  // Prefer dedicated STANDING_ORDERS.md, fall back to global CLAUDE.md
+  const candidates = [
+    `${WORKSPACE_GLOBAL}/STANDING_ORDERS.md`,
+    `${WORKSPACE_GLOBAL}/CLAUDE.md`,
+  ];
+  let content = '';
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      content = fs.readFileSync(p, 'utf-8');
+      break;
+    }
+  }
+  if (!content) return;
+
+  _fullStandingOrders = content;
+
+  // Build condensed version — keep only the critical rules listed above
+  const lines = content.split('\n');
+  const condensedParts: string[] = [
+    '# Standing Orders (condensed — critical rules only)',
+    '',
+  ];
+  let inCritical = false;
+  for (const line of lines) {
+    if (line.startsWith('## Rule ')) {
+      const label = line.split(':')[0].replace('## ', '').trim();
+      inCritical = CONDENSED_RULE_PREFIXES.some((p) => label.startsWith(p));
+      if (inCritical) condensedParts.push(line);
+    } else if (inCritical) {
+      if (line.startsWith('## Rule ') || line.startsWith('---')) {
+        inCritical = false;
+      } else {
+        condensedParts.push(line);
+      }
+    }
+  }
+  _condensedStandingOrders = condensedParts.join('\n').trim();
+  if (!_condensedStandingOrders) {
+    _condensedStandingOrders = content.slice(0, 500) + '\n\n[...condensed]';
+  }
+}
+
 /**
- * UserPromptSubmit hook: inject STANDING_ORDERS and fleet context
- * before the model sees each prompt. Returns additionalContext which
- * the SDK appends as a system-level reminder.
+ * UserPromptSubmit hook: inject STANDING_ORDERS on every turn so rules
+ * survive compaction. First turn of each session gets the full document;
+ * subsequent turns get only the critical rules to conserve tokens.
  */
 function createSessionRulesHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as UserPromptSubmitHookInput;
+    loadStandingOrders();
+
+    if (!_fullStandingOrders) return {};
+
+    const sessionId = evt.session_id;
+    const isFirstTurn = !_seenSessions.has(sessionId);
+    if (isFirstTurn) _seenSessions.add(sessionId);
+
     const parts: string[] = [];
+    if (isFirstTurn) {
+      parts.push('[FLEET-RULES — full load]\n\n' + _fullStandingOrders);
 
-    // Load STANDING_ORDERS from global group (fleet-wide rules)
-    const standingOrdersPath = `${WORKSPACE_GLOBAL}/CLAUDE.md`;
-    if (fs.existsSync(standingOrdersPath)) {
-      const content = fs.readFileSync(standingOrdersPath, 'utf-8');
-      parts.push('# Fleet Standing Orders\n' + content);
+      // Include agent-config.yaml once on first turn for routing context
+      const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+      if (fs.existsSync(agentConfigPath)) {
+        const config = fs.readFileSync(agentConfigPath, 'utf-8');
+        parts.push('# Agent Config (routing reference)\n```yaml\n' + config + '\n```');
+      }
+    } else {
+      parts.push('[FLEET-RULES — condensed]\n\n' + _condensedStandingOrders);
     }
 
-    // Load agent-config.yaml summary for routing awareness
-    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
-    if (fs.existsSync(agentConfigPath)) {
-      const config = fs.readFileSync(agentConfigPath, 'utf-8');
-      parts.push('# Agent Config (routing reference)\n```yaml\n' + config + '\n```');
-    }
-
-    if (parts.length === 0) return {};
-
-    log(`Session-rules hook: injected ${parts.length} context block(s)`);
+    log(
+      `Session-rules: ${isFirstTurn ? 'full' : 'condensed'} injection (session ${sessionId.slice(0, 8)})`,
+    );
     return {
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit' as const,
@@ -320,21 +381,43 @@ function createManifestContextHook(): HookCallback {
  * Logs violations to self-improving/violations.jsonl.
  * Messages ending with _thinkingoutloud are exempt.
  */
-function createInboxEnforcerHook(): HookCallback {
+const INBOX_ENFORCER_ACK_PATTERNS = [
+  'heartbeat_ok', 'no_reply', 'merged', 'done',
+  'acknowledged', "ack'd", 'ack', 'got it', 'on it',
+];
+
+function createInboxEnforcerHook(platform?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
     const message = evt.last_assistant_message;
     if (!message) return {};
 
-    // Exempt _thinkingoutloud messages
-    if (message.trimEnd().endsWith('_thinkingoutloud')) return {};
+    // Platform filter: inbox enforcement only applies to gateway platforms
+    // (Discord, Slack, etc.), not CLI/local runs. Skip if platform is CLI-like.
+    const plat = (platform || process.env.NANOCLAW_PLATFORM || '').toLowerCase();
+    if (plat === 'cli' || plat === 'local') return {};
 
-    // Exempt short acks (under 50 chars)
-    if (message.length < 50) return {};
+    const trimmed = message.trim();
+    const lower = trimmed.toLowerCase();
+
+    // Exempt: _thinkingoutloud suffix
+    if (trimmed.endsWith('_thinkingoutloud')) return {};
+
+    // Exempt: contains HEARTBEAT_OK or NO_REPLY sentinels (any case variant)
+    if (lower.includes('heartbeat_ok') || lower.includes('no_reply')) return {};
+
+    // Exempt: pure ack under 30 chars containing a known ack phrase
+    if (trimmed.length < 30 && INBOX_ENFORCER_ACK_PATTERNS.some((p) => lower.includes(p))) {
+      return {};
+    }
+
+    // Skip very short messages outright (below old 50-char threshold kept
+    // for non-ack messages that are just too brief to meaningfully enforce)
+    if (trimmed.length < 30) return {};
 
     // Check for @mentions without [inbox:ID] tags
-    const mentionPattern = /@\w+/g;
-    const inboxPattern = /\[inbox:[^\]]+\]/;
+    const mentionPattern = /@\w+|<@!?\d+>/g;
+    const inboxPattern = /\[inbox:[^\]]+\]/i;
     const mentions = message.match(mentionPattern);
 
     if (mentions && mentions.length > 0 && !inboxPattern.test(message)) {
@@ -344,6 +427,7 @@ function createInboxEnforcerHook(): HookCallback {
         mentions: mentions,
         messagePreview: message.slice(0, 200),
         type: 'orphan-mention',
+        platform: plat || 'unknown',
       };
 
       const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
@@ -384,53 +468,80 @@ function createLearningSyncHook(agentName?: string): HookCallback {
     // Check if corrections.md has changed since last sync
     const stat = fs.statSync(correctionsPath);
     let lastMtime = 0;
+    let syncedKeys = new Set<string>();
     if (fs.existsSync(syncStatePath)) {
       try {
         const state = JSON.parse(fs.readFileSync(syncStatePath, 'utf-8'));
         lastMtime = state.lastMtime || 0;
+        syncedKeys = new Set(state.syncedKeys || []);
       } catch { /* ignore */ }
     }
 
     if (stat.mtimeMs <= lastMtime) return {};
 
-    // Parse new corrections (entries after ## headers with "promoted" status)
+    // Parse ALL new correction entries since last sync.
+    // A correction is a block starting with `## YYYY-MM-DD HH:MM — <title>`
+    // followed by **What I got wrong:** or **Content:** fields.
     const content = fs.readFileSync(correctionsPath, 'utf-8');
-    const promotedEntries = content.match(
-      /## .+ — Promoted pattern.*?\n\*\*Note:\*\* (.+)/g,
-    );
+    const entryRegex = /^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — (.+)$([\s\S]*?)(?=^## \d{4}-|\Z)/gm;
 
-    if (promotedEntries && promotedEntries.length > 0) {
-      const patternsDir = path.dirname(patternsPath);
-      fs.mkdirSync(patternsDir, { recursive: true });
+    const patternsDir = path.dirname(patternsPath);
+    fs.mkdirSync(patternsDir, { recursive: true });
 
-      for (const entry of promotedEntries) {
-        const pattern = {
-          id: `p-${agentName || 'unknown'}-${Date.now()}`,
-          uuid: crypto.randomUUID(),
-          agent: agentName || 'unknown',
-          harness: 'nanoclaw',
-          clan: 'lambda',
-          ts: new Date().toISOString(),
-          category: 'correction',
-          title: 'Auto-promoted correction pattern',
-          problem: entry.slice(0, 500),
-          solution: 'See corrections.md for details',
-          tags: ['auto-promoted'],
-          status: 'active',
-          supersedes: null,
-        };
-        fs.appendFileSync(patternsPath, JSON.stringify(pattern) + '\n');
-      }
+    let appended = 0;
+    let match: RegExpExecArray | null;
+    while ((match = entryRegex.exec(content)) !== null) {
+      const [, ts, title, body] = match;
+      const key = `${ts}::${title.trim().slice(0, 80)}`;
+      if (syncedKeys.has(key)) continue;
 
+      // Extract body fields
+      const gotWrong = body.match(/\*\*What I got wrong:\*\*\s*(.+)/)?.[1]?.trim();
+      const correctApproach = body.match(/\*\*Correct approach:\*\*\s*(.+)/)?.[1]?.trim();
+      const source = body.match(/\*\*Source:\*\*\s*(.+)/)?.[1]?.trim()
+        || body.match(/\*\*Signal from:\*\*\s*(.+)/)?.[1]?.trim()
+        || 'unknown';
+      const patternDesc = body.match(/\*\*Pattern:\*\*\s*(.+)/)?.[1]?.trim();
+      const signalContent = body.match(/\*\*Content:\*\*\s*(.+)/)?.[1]?.trim();
+      const tier = body.match(/\*\*Tier:\*\*\s*(\w+)/)?.[1]?.trim();
+
+      const problem = gotWrong || signalContent || title.trim();
+      const solution = correctApproach || patternDesc || 'See corrections.md for details';
+
+      const pattern = {
+        id: `p-${agentName || 'unknown'}-${Date.now()}-${appended}`,
+        uuid: crypto.randomUUID(),
+        agent: agentName || 'unknown',
+        harness: 'nanoclaw',
+        clan: 'lambda',
+        ts: new Date().toISOString(),
+        source_ts: ts,
+        category: 'correction',
+        title: title.trim().slice(0, 120),
+        problem: problem.slice(0, 500),
+        solution: solution.slice(0, 500),
+        tags: tier ? ['auto-detected', `tier:${tier}`, `source:${source}`] : ['manual', `source:${source}`],
+        status: 'active',
+        supersedes: null,
+      };
+      fs.appendFileSync(patternsPath, JSON.stringify(pattern) + '\n');
+      syncedKeys.add(key);
+      appended++;
+    }
+
+    if (appended > 0) {
       log(
-        `Learning-sync: appended ${promotedEntries.length} pattern(s) to patterns.jsonl`,
+        `Learning-sync: appended ${appended} pattern(s) to patterns.jsonl`,
       );
     }
 
     // Update sync state
     fs.writeFileSync(
       syncStatePath,
-      JSON.stringify({ lastMtime: stat.mtimeMs }) + '\n',
+      JSON.stringify({
+        lastMtime: stat.mtimeMs,
+        syncedKeys: Array.from(syncedKeys),
+      }) + '\n',
     );
 
     return {};
@@ -617,6 +728,73 @@ function discoverSkillHooks(): SkillHookDeclaration[] {
   return declarations;
 }
 
+interface SignalsConfig {
+  correctionSignals: {
+    strong: string[];
+    medium: string[];
+    weak: string[];
+  };
+  excludePatterns: string[];
+  minimumConfidence: 'strong' | 'medium' | 'weak';
+  agentNames: string[];
+}
+
+let _signalsCache: SignalsConfig | null = null;
+
+/**
+ * Load signals.json from the agent-runner source directory. Cached after
+ * first read. Falls back to empty config if file missing.
+ */
+function loadSignals(): SignalsConfig {
+  if (_signalsCache) return _signalsCache;
+
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const signalsPath = path.join(__dirname, 'signals.json');
+
+  const empty: SignalsConfig = {
+    correctionSignals: { strong: [], medium: [], weak: [] },
+    excludePatterns: [],
+    minimumConfidence: 'medium',
+    agentNames: [],
+  };
+
+  try {
+    if (!fs.existsSync(signalsPath)) {
+      log(`signals.json not found at ${signalsPath} — self-reflection disabled`);
+      _signalsCache = empty;
+      return empty;
+    }
+    _signalsCache = JSON.parse(fs.readFileSync(signalsPath, 'utf-8')) as SignalsConfig;
+    log(`Loaded signals.json (strong: ${_signalsCache.correctionSignals.strong.length}, medium: ${_signalsCache.correctionSignals.medium.length}, weak: ${_signalsCache.correctionSignals.weak.length})`);
+    return _signalsCache;
+  } catch (err) {
+    log(`Failed to load signals.json: ${err instanceof Error ? err.message : String(err)}`);
+    _signalsCache = empty;
+    return empty;
+  }
+}
+
+/**
+ * Detect the highest signal tier that matches the text, respecting
+ * minimumConfidence. Returns the tier name or null if no match.
+ */
+function detectSignalTier(
+  lowerText: string,
+  signals: SignalsConfig,
+): 'strong' | 'medium' | 'weak' | null {
+  const order: Array<'strong' | 'medium' | 'weak'> = ['strong', 'medium', 'weak'];
+  const minIdx = order.indexOf(signals.minimumConfidence);
+  // Consider tiers from strong down to minimumConfidence
+  for (let i = 0; i <= minIdx; i++) {
+    const tier = order[i];
+    const patterns = signals.correctionSignals[tier];
+    if (patterns.some((p) => lowerText.includes(p.toLowerCase()))) {
+      return tier;
+    }
+  }
+  return null;
+}
+
 /**
  * Self-reflection hook: scan recent transcript for correction signals.
  * Runs after each query completes. Detects corrections from humans or build
@@ -667,20 +845,9 @@ async function runSelfReflection(sessionId: string | undefined): Promise<void> {
   // Only scan the last 20 messages for corrections
   const recentLines = lines.slice(-20);
 
-  // Correction signal patterns
-  const correctionSignals = [
-    /\bno[,.]?\s+(?:don't|do not|not like that|that's wrong|incorrect)/i,
-    /\bwrong\b/i,
-    /\binstead\b.*\bshould\b/i,
-    /\bshould (?:have |be |use )/i,
-    /\bnever\b.*\bdo that\b/i,
-    /\bstop\b.*\bdoing\b/i,
-    /\bthat's not\b/i,
-    /\bplease don't\b/i,
-    /\bactually[,.]?\s+(?:it|you|the|we|I)/i,
-  ];
-
-  const detectedCorrections: Array<{ text: string; source: string }> = [];
+  // Load 3-tier signal dictionary from signals.json (falls back to empty on error)
+  const signals = loadSignals();
+  const detectedCorrections: Array<{ text: string; source: string; tier: string }> = [];
 
   for (const line of recentLines) {
     try {
@@ -694,11 +861,16 @@ async function runSelfReflection(sessionId: string | undefined): Promise<void> {
               .map((c: { text?: string }) => c.text || '')
               .join('');
 
-      for (const signal of correctionSignals) {
-        if (signal.test(text)) {
-          detectedCorrections.push({ text: text.slice(0, 500), source: 'human' });
-          break;
-        }
+      const lowerText = text.toLowerCase();
+
+      // Exclude-pattern check first — skip known false-positives
+      if (signals.excludePatterns.some((p) => lowerText.includes(p))) continue;
+
+      // Check tiers in priority order: strong > medium > weak
+      // Respect minimumConfidence threshold
+      const tier = detectSignalTier(lowerText, signals);
+      if (tier) {
+        detectedCorrections.push({ text: text.slice(0, 500), source: 'human', tier });
       }
     } catch {
       continue;
@@ -723,8 +895,9 @@ async function runSelfReflection(sessionId: string | undefined): Promise<void> {
   }
 
   for (const correction of detectedCorrections) {
-    correctionsContent += `\n## ${dateStr} — Detected correction\n`;
+    correctionsContent += `\n## ${dateStr} — Detected correction (${correction.tier})\n`;
     correctionsContent += `**Signal from:** ${correction.source}\n`;
+    correctionsContent += `**Tier:** ${correction.tier}\n`;
     correctionsContent += `**Content:** ${correction.text}\n`;
     correctionsContent += `**Status:** pending-review\n\n`;
   }

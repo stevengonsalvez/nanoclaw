@@ -1,0 +1,29 @@
+{
+  "correctionSignals": {
+    "strong": [
+      "no, ", "no that's", "no thats", "wrong", "actually,", "actually ",
+      "stop doing", "don't do", "dont do", "should be", "should have",
+      "instead of", "not like that", "that's not", "thats not",
+      "I told you", "i told you", "how many times", "I said", "i said",
+      "never do", "always do", "you keep", "you forgot",
+      "that's wrong", "thats wrong", "incorrect",
+      "not what I asked", "not what i asked",
+      "why did you", "why do you keep"
+    ],
+    "medium": [
+      "prefer ", "I prefer", "i prefer", "rather than", "better to",
+      "next time", "in future", "in the future", "remember to",
+      "don't forget", "dont forget", "make sure to", "please stop"
+    ],
+    "weak": [
+      "hmm", "not quite", "close but", "almost", "not exactly", "sort of"
+    ]
+  },
+  "excludePatterns": [
+    "no worries", "no problem", "no rush", "no need", "no thanks",
+    "actually good", "actually great", "actually perfect",
+    "stop me if", "wrong channel"
+  ],
+  "minimumConfidence": "medium",
+  "agentNames": ["geordi", "data", "freeman", "motoko"]
+}
