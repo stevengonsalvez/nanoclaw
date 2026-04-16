@@ -21,8 +21,17 @@ import {
   query,
   HookCallback,
   PreCompactHookInput,
+  UserPromptSubmitHookInput,
+  StopHookInput,
+  SessionStartHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import {
+  loadConvexConfig,
+  postEvent,
+  pollInbox,
+  prioritizeItems,
+} from './inbox/convex-client.js';
 
 interface ContainerInput {
   prompt: string;
@@ -212,6 +221,400 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 
     return {};
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fleet hooks — session-rules, manifest-context, inbox-enforcer,
+// learning-sync, learning-verifier
+// ---------------------------------------------------------------------------
+
+/**
+ * UserPromptSubmit hook: inject STANDING_ORDERS and fleet context
+ * before the model sees each prompt. Returns additionalContext which
+ * the SDK appends as a system-level reminder.
+ */
+function createSessionRulesHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as UserPromptSubmitHookInput;
+    const parts: string[] = [];
+
+    // Load STANDING_ORDERS from global group (fleet-wide rules)
+    const standingOrdersPath = `${WORKSPACE_GLOBAL}/CLAUDE.md`;
+    if (fs.existsSync(standingOrdersPath)) {
+      const content = fs.readFileSync(standingOrdersPath, 'utf-8');
+      parts.push('# Fleet Standing Orders\n' + content);
+    }
+
+    // Load agent-config.yaml summary for routing awareness
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    if (fs.existsSync(agentConfigPath)) {
+      const config = fs.readFileSync(agentConfigPath, 'utf-8');
+      parts.push('# Agent Config (routing reference)\n```yaml\n' + config + '\n```');
+    }
+
+    if (parts.length === 0) return {};
+
+    log(`Session-rules hook: injected ${parts.length} context block(s)`);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit' as const,
+        additionalContext: parts.join('\n\n'),
+      },
+    };
+  };
+}
+
+/**
+ * SessionStart hook: inject manifest context and cross-agent learnings
+ * on the first turn of a new session.
+ */
+function createManifestContextHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as SessionStartHookInput;
+    const parts: string[] = [];
+
+    // Load clan manifest if it exists
+    const manifestPath = path.join(
+      process.env.HOME || '~',
+      '.clan',
+      'manifest.yaml',
+    );
+    if (fs.existsSync(manifestPath)) {
+      const content = fs.readFileSync(manifestPath, 'utf-8');
+      parts.push('# Clan Manifest\n```yaml\n' + content + '\n```');
+    }
+
+    // Load cross-agent learnings (patterns.md — human-readable summary)
+    const patternsPath = path.join(
+      process.env.HOME || '~',
+      '.clan',
+      'learnings',
+      'patterns.md',
+    );
+    if (fs.existsSync(patternsPath)) {
+      const content = fs.readFileSync(patternsPath, 'utf-8');
+      // Only include last 2000 chars to stay within token budget
+      const trimmed =
+        content.length > 2000
+          ? '...(truncated)\n' + content.slice(-2000)
+          : content;
+      parts.push('# Cross-Agent Learnings\n' + trimmed);
+    }
+
+    if (parts.length === 0) return {};
+
+    log(
+      `Manifest-context hook: injected ${parts.length} context block(s) (source: ${evt.source})`,
+    );
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart' as const,
+        additionalContext: parts.join('\n\n'),
+      },
+    };
+  };
+}
+
+/**
+ * Stop hook: scan the last assistant message for untagged @mentions.
+ * Logs violations to self-improving/violations.jsonl.
+ * Messages ending with _thinkingoutloud are exempt.
+ */
+function createInboxEnforcerHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+    const message = evt.last_assistant_message;
+    if (!message) return {};
+
+    // Exempt _thinkingoutloud messages
+    if (message.trimEnd().endsWith('_thinkingoutloud')) return {};
+
+    // Exempt short acks (under 50 chars)
+    if (message.length < 50) return {};
+
+    // Check for @mentions without [inbox:ID] tags
+    const mentionPattern = /@\w+/g;
+    const inboxPattern = /\[inbox:[^\]]+\]/;
+    const mentions = message.match(mentionPattern);
+
+    if (mentions && mentions.length > 0 && !inboxPattern.test(message)) {
+      const violation = {
+        ts: new Date().toISOString(),
+        sessionId: evt.session_id,
+        mentions: mentions,
+        messagePreview: message.slice(0, 200),
+        type: 'orphan-mention',
+      };
+
+      const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
+      const dir = path.dirname(violationsPath);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(
+        violationsPath,
+        JSON.stringify(violation) + '\n',
+      );
+
+      log(
+        `Inbox-enforcer: logged violation — ${mentions.length} mention(s) without [inbox:ID]`,
+      );
+    }
+
+    return {};
+  };
+}
+
+/**
+ * Stop hook: sync corrections from self-improving/corrections.md
+ * to the shared clan learnings store (~/.clan/learnings/patterns.jsonl).
+ * Tracks last sync position to avoid re-appending.
+ */
+function createLearningSyncHook(agentName?: string): HookCallback {
+  return async (_input, _toolUseId, _context) => {
+    const correctionsPath = `${WORKSPACE_GROUP}/self-improving/corrections.md`;
+    const syncStatePath = `${WORKSPACE_GROUP}/self-improving/.learning-sync-state.json`;
+    const patternsPath = path.join(
+      process.env.HOME || '~',
+      '.clan',
+      'learnings',
+      'patterns.jsonl',
+    );
+
+    if (!fs.existsSync(correctionsPath)) return {};
+
+    // Check if corrections.md has changed since last sync
+    const stat = fs.statSync(correctionsPath);
+    let lastMtime = 0;
+    if (fs.existsSync(syncStatePath)) {
+      try {
+        const state = JSON.parse(fs.readFileSync(syncStatePath, 'utf-8'));
+        lastMtime = state.lastMtime || 0;
+      } catch { /* ignore */ }
+    }
+
+    if (stat.mtimeMs <= lastMtime) return {};
+
+    // Parse new corrections (entries after ## headers with "promoted" status)
+    const content = fs.readFileSync(correctionsPath, 'utf-8');
+    const promotedEntries = content.match(
+      /## .+ — Promoted pattern.*?\n\*\*Note:\*\* (.+)/g,
+    );
+
+    if (promotedEntries && promotedEntries.length > 0) {
+      const patternsDir = path.dirname(patternsPath);
+      fs.mkdirSync(patternsDir, { recursive: true });
+
+      for (const entry of promotedEntries) {
+        const pattern = {
+          id: `p-${agentName || 'unknown'}-${Date.now()}`,
+          uuid: crypto.randomUUID(),
+          agent: agentName || 'unknown',
+          harness: 'nanoclaw',
+          clan: 'lambda',
+          ts: new Date().toISOString(),
+          category: 'correction',
+          title: 'Auto-promoted correction pattern',
+          problem: entry.slice(0, 500),
+          solution: 'See corrections.md for details',
+          tags: ['auto-promoted'],
+          status: 'active',
+          supersedes: null,
+        };
+        fs.appendFileSync(patternsPath, JSON.stringify(pattern) + '\n');
+      }
+
+      log(
+        `Learning-sync: appended ${promotedEntries.length} pattern(s) to patterns.jsonl`,
+      );
+    }
+
+    // Update sync state
+    fs.writeFileSync(
+      syncStatePath,
+      JSON.stringify({ lastMtime: stat.mtimeMs }) + '\n',
+    );
+
+    return {};
+  };
+}
+
+/**
+ * Stop hook: check if the agent missed a known pattern from the shared
+ * learnings store. Scans the last assistant message for keywords that
+ * match patterns in patterns.jsonl but weren't applied.
+ */
+function createLearningVerifierHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+    const message = evt.last_assistant_message;
+    if (!message) return {};
+
+    const patternsPath = path.join(
+      process.env.HOME || '~',
+      '.clan',
+      'learnings',
+      'patterns.jsonl',
+    );
+    if (!fs.existsSync(patternsPath)) return {};
+
+    let patterns: Array<{
+      id: string;
+      title: string;
+      problem: string;
+      solution: string;
+      tags?: string[];
+    }>;
+    try {
+      patterns = fs
+        .readFileSync(patternsPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line))
+        .filter((p) => p.status === 'active');
+    } catch {
+      return {};
+    }
+
+    if (patterns.length === 0) return {};
+
+    // Extract keywords from message (words 4+ chars, lowered)
+    const messageWords = new Set(
+      message
+        .toLowerCase()
+        .split(/\W+/)
+        .filter((w) => w.length >= 4),
+    );
+
+    // Check each pattern for keyword overlap (2+ matching keywords)
+    const missedPatterns: string[] = [];
+    for (const pattern of patterns) {
+      const patternWords = [
+        ...(pattern.problem || '').toLowerCase().split(/\W+/),
+        ...(pattern.tags || []).map((t) => t.toLowerCase()),
+      ].filter((w) => w.length >= 4);
+
+      const overlap = patternWords.filter((w) => messageWords.has(w));
+      if (overlap.length >= 2) {
+        missedPatterns.push(pattern.id);
+      }
+    }
+
+    if (missedPatterns.length > 0) {
+      const missedPath = `${WORKSPACE_GROUP}/self-improving/missed-learnings.jsonl`;
+      const dir = path.dirname(missedPath);
+      fs.mkdirSync(dir, { recursive: true });
+
+      const entry = {
+        ts: new Date().toISOString(),
+        sessionId: evt.session_id,
+        matchedPatterns: missedPatterns,
+        messagePreview: message.slice(0, 200),
+      };
+      fs.appendFileSync(missedPath, JSON.stringify(entry) + '\n');
+
+      log(
+        `Learning-verifier: ${missedPatterns.length} potentially missed pattern(s)`,
+      );
+    }
+
+    return {};
+  };
+}
+
+/**
+ * Stop hook: emit lifecycle events to Convex (message:sent, session events).
+ * Fire-and-forget — does not block the agent.
+ */
+function createConvexEventHook(agentName?: string): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+    if (!config) return {};
+
+    await postEvent(config.convexUrl, {
+      type: 'message:sent',
+      agent: config.agent,
+      project: config.project,
+      clan: config.clan,
+      data: {
+        sessionId: evt.session_id,
+        hasMessage: !!evt.last_assistant_message,
+        messageLength: evt.last_assistant_message?.length || 0,
+      },
+    });
+
+    return {};
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Skill-level hook discovery
+// ---------------------------------------------------------------------------
+
+interface SkillHookDeclaration {
+  skillName: string;
+  events: string[];
+  scriptPath?: string;
+}
+
+/**
+ * Scan container skills for hook declarations in frontmatter.
+ * Skills can declare hooks via:
+ *   ---
+ *   hooks:
+ *     Stop: true
+ *     UserPromptSubmit: true
+ *   ---
+ * or:
+ *   ---
+ *   hooks:
+ *     Stop: ./scripts/my-hook.sh
+ *   ---
+ *
+ * Returns declarations that the agent-runner can wire into the SDK query.
+ * Currently used for documentation/discovery — script-based hooks execute
+ * the declared script; boolean hooks log the event for the skill to consume.
+ */
+function discoverSkillHooks(): SkillHookDeclaration[] {
+  const skillsDir = path.join(CLAUDE_HOME, 'skills');
+  if (!fs.existsSync(skillsDir)) return [];
+
+  const declarations: SkillHookDeclaration[] = [];
+
+  for (const entry of fs.readdirSync(skillsDir)) {
+    const skillDir = path.join(skillsDir, entry);
+    if (!fs.statSync(skillDir).isDirectory()) continue;
+
+    const skillMdPath = path.join(skillDir, 'SKILL.md');
+    if (!fs.existsSync(skillMdPath)) continue;
+
+    const content = fs.readFileSync(skillMdPath, 'utf-8');
+    // Parse YAML frontmatter between --- markers
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) continue;
+
+    const frontmatter = fmMatch[1];
+    // Check for hooks: block
+    const hooksMatch = frontmatter.match(/^hooks:\s*\n((?:\s+\w+:.*\n?)*)/m);
+    if (!hooksMatch) continue;
+
+    const hookLines = hooksMatch[1].split('\n').filter((l) => l.trim());
+    const events: string[] = [];
+    for (const line of hookLines) {
+      const lineMatch = line.match(/^\s+(\w+):\s*(.+)$/);
+      if (lineMatch) {
+        events.push(lineMatch[1]);
+      }
+    }
+
+    if (events.length > 0) {
+      declarations.push({ skillName: entry, events });
+      log(`Skill "${entry}" declares hooks: ${events.join(', ')}`);
+    }
+  }
+
+  return declarations;
 }
 
 /**
@@ -566,6 +969,19 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  // Load per-group bounded memory files (MEMORY.md + USER.md)
+  const memoryPath = `${WORKSPACE_GROUP}/memories/MEMORY.md`;
+  const userProfilePath = `${WORKSPACE_GROUP}/memories/USER.md`;
+  let memoryContext = '';
+  if (fs.existsSync(memoryPath)) {
+    memoryContext += '\n\n# Agent Memory\n' + fs.readFileSync(memoryPath, 'utf-8');
+    log('Loaded memories/MEMORY.md');
+  }
+  if (fs.existsSync(userProfilePath)) {
+    memoryContext += '\n\n# User Profile\n' + fs.readFileSync(userProfilePath, 'utf-8');
+    log('Loaded memories/USER.md');
+  }
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -589,11 +1005,11 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
+      systemPrompt: (globalClaudeMd || memoryContext)
         ? {
             type: 'preset' as const,
             preset: 'claude_code' as const,
-            append: globalClaudeMd,
+            append: (globalClaudeMd || '') + memoryContext,
           }
         : undefined,
       allowedTools: [
@@ -635,6 +1051,22 @@ async function runQuery(
       hooks: {
         PreCompact: [
           { hooks: [createPreCompactHook(containerInput.assistantName)] },
+        ],
+        UserPromptSubmit: [
+          { hooks: [createSessionRulesHook()] },
+        ],
+        SessionStart: [
+          { hooks: [createManifestContextHook()] },
+        ],
+        Stop: [
+          {
+            hooks: [
+              createInboxEnforcerHook(),
+              createLearningSyncHook(containerInput.assistantName),
+              createLearningVerifierHook(),
+              createConvexEventHook(containerInput.assistantName),
+            ],
+          },
         ],
       },
     },
@@ -766,6 +1198,12 @@ async function main(): Promise<void> {
       error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
+  }
+
+  // Discover skill-level hook declarations (logged for observability)
+  const skillHooks = discoverSkillHooks();
+  if (skillHooks.length > 0) {
+    log(`Discovered ${skillHooks.length} skill(s) with hook declarations`);
   }
 
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
