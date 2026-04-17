@@ -206,6 +206,47 @@ export async function postEvent(
 }
 
 /**
+ * Shared ACP-metrics record shape used across harnesses.
+ * Emitted on thread close (via /api/metrics/acp) + persisted locally.
+ */
+export interface ACPMetrics {
+  threadId: string;
+  protocol: 'acp/1' | 'natural' | 'mixed';
+  messageCount: number;
+  agentsInvolved: string[];
+  timeToResolutionMin: number;
+  estimatedTokens?: number;
+  loopsDetected: number;
+  humanInterventions: number;
+  outcome: 'resolved' | 'handed-off' | 'abandoned' | 'unknown';
+  project?: string;
+  clan?: string;
+  harness?: string;
+  ts?: string;
+}
+
+/**
+ * Post ACP metrics on thread close. Fire-and-forget, logs failures.
+ */
+export async function postMetric(
+  convexUrl: string,
+  metric: ACPMetrics,
+): Promise<void> {
+  metric.ts = metric.ts || new Date().toISOString();
+  try {
+    await fetchWithTimeout(`${convexUrl}/api/metrics/acp`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(metric),
+    });
+  } catch (err) {
+    console.error(
+      `[convex-client] Failed to post metric: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Prioritize inbox items per Fleet Lambda protocol:
  * 1. sev-1, sev-2 (incidents — immediate)
  * 2. deploy, handoff (partner handoff)

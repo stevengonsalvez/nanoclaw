@@ -29,9 +29,12 @@ import { fileURLToPath } from 'url';
 import {
   loadConvexConfig,
   postEvent,
+  postMetric,
   pollInbox,
   prioritizeItems,
+  ACPMetrics,
 } from './inbox/convex-client.js';
+import { readRecentDiscoveries } from './inbox/discoveries.js';
 
 interface ContainerInput {
   prompt: string;
@@ -329,7 +332,7 @@ function createSessionRulesHook(): HookCallback {
  * SessionStart hook: inject manifest context and cross-agent learnings
  * on the first turn of a new session.
  */
-function createManifestContextHook(): HookCallback {
+function createManifestContextHook(agentName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as SessionStartHookInput;
     const parts: string[] = [];
@@ -360,6 +363,43 @@ function createManifestContextHook(): HookCallback {
           ? '...(truncated)\n' + content.slice(-2000)
           : content;
       parts.push('# Cross-Agent Learnings\n' + trimmed);
+    }
+
+    // Discovery gossip — last 20 entries from shared discoveries.jsonl
+    const recentDiscoveries = readRecentDiscoveries(20);
+    if (recentDiscoveries.length > 0) {
+      parts.push(
+        '# Recent Discoveries (last 20 — non-obvious findings from the fleet)\n' +
+          recentDiscoveries.join('\n'),
+      );
+    }
+
+    // Resume-from-inbox — poll Convex for pending items targeting this agent.
+    // Inbox is the source of truth; Discord is notification. On session start
+    // we check inbox FIRST before reading chat scrollback so the agent resumes
+    // pending work even if Discord notifications were missed.
+    try {
+      const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+      const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+      if (config && config.agent !== 'unknown') {
+        const items = await pollInbox(config);
+        const prioritized = prioritizeItems(items);
+        if (prioritized.length > 0) {
+          const summary = prioritized.slice(0, 10).map((item, idx) => {
+            const labels = (item.labels || []).join(',') || 'routine';
+            return `${idx + 1}. [${labels}] ${item._id} — ${item.title}`;
+          });
+          parts.push(
+            '# Pending Inbox Items (resume-from-inbox on session start)\n' +
+              `You have ${prioritized.length} pending inbox item(s). Read them first before any Discord chatter.\n\n` +
+              summary.join('\n') +
+              '\n\nProtocol: ACK → work → complete. sev-1/sev-2 first, then deploy/handoff, then routine.',
+          );
+          log(`Resume-from-inbox: ${prioritized.length} pending item(s) for ${config.agent}`);
+        }
+      }
+    } catch (err) {
+      log(`Resume-from-inbox poll failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (parts.length === 0) return {};
@@ -441,6 +481,66 @@ function createInboxEnforcerHook(platform?: string): HookCallback {
       log(
         `Inbox-enforcer: logged violation — ${mentions.length} mention(s) without [inbox:ID]`,
       );
+    }
+
+    // Content validation: if the message contains inbox-creation intent
+    // (natural language like "create inbox item", "filing inbox", or a
+    // structured announcement pattern), validate required fields are
+    // present. Required: subject, targetAgent (agent name or "mortal"),
+    // and either issueRef or explicit "no-issue" justification.
+    const creationIntent =
+      /\b(create|creating|filed?|filing|new)\s+inbox\s+(item|task|request)/i.test(
+        message,
+      ) ||
+      /\binbox:\s*(new|create)/i.test(message) ||
+      /\b(targetAgent|target_agent|target):\s*(geordi|data|freeman|motoko|mortal)/i.test(
+        message,
+      );
+
+    if (creationIntent) {
+      const missing: string[] = [];
+      // Check for subject/title line
+      if (
+        !/\b(subject|title|task):\s*\S/i.test(message) &&
+        !/\binbox-item:\s*\S/i.test(message)
+      ) {
+        missing.push('subject');
+      }
+      // Check for targetAgent
+      if (
+        !/\b(targetAgent|target_agent|target|to)\s*[:=]\s*(geordi|data|freeman|motoko|mortal)/i.test(
+          message,
+        )
+      ) {
+        missing.push('targetAgent');
+      }
+      // Check for issueRef (or explicit no-issue/bug-fix/config disclaimer)
+      const hasIssueRef = /\b\S+\/\S+#\d+\b/.test(message);
+      const noIssueJustified =
+        /\b(no[-\s]?issue|bug[-\s]?fix|config|docs|no\s+issue\s+needed)\b/i.test(
+          message,
+        );
+      if (!hasIssueRef && !noIssueJustified) {
+        missing.push('issueRef (or explicit no-issue justification)');
+      }
+
+      if (missing.length > 0) {
+        const violation = {
+          ts: new Date().toISOString(),
+          sessionId: evt.session_id,
+          messagePreview: message.slice(0, 300),
+          type: 'incomplete-inbox-content',
+          missingFields: missing,
+          platform: plat || 'unknown',
+        };
+        const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
+        const dir = path.dirname(violationsPath);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(violationsPath, JSON.stringify(violation) + '\n');
+        log(
+          `Inbox-enforcer: content violation — inbox creation intent missing ${missing.join(', ')}`,
+        );
+      }
     }
 
     return {};
@@ -655,6 +755,125 @@ function createConvexEventHook(agentName?: string): HookCallback {
       },
     });
 
+    return {};
+  };
+}
+
+/**
+ * Detect thread-close intent from the last assistant message.
+ * Returns the detected outcome, or null if not a close.
+ */
+const THREAD_CLOSE_PATTERNS: Array<{
+  re: RegExp;
+  outcome: ACPMetrics['outcome'];
+}> = [
+  { re: /\bSTATE:\s*(MERGED|CLOSED)\b/i, outcome: 'resolved' },
+  { re: /\bACTION:\s*(close|done|completed?)\b/i, outcome: 'resolved' },
+  { re: /\b(thread[-\s]?close(d)?|resolved|resolving)\b/i, outcome: 'resolved' },
+  { re: /\bACTION:\s*handoff\b/i, outcome: 'handed-off' },
+  { re: /\bTARGET:\s*\w+\b.*\bACTION:\s*(deploy|review)\b/i, outcome: 'handed-off' },
+  { re: /\b(abandon(ed|ing)?|giving up|stalled)\b/i, outcome: 'abandoned' },
+];
+
+function detectThreadClose(message: string): ACPMetrics['outcome'] | null {
+  for (const { re, outcome } of THREAD_CLOSE_PATTERNS) {
+    if (re.test(message)) return outcome;
+  }
+  return null;
+}
+
+/**
+ * Count ACP/1 structured headers and naturalism in the message.
+ * Heuristic protocol detector.
+ */
+function detectProtocol(message: string): ACPMetrics['protocol'] {
+  const hasAcpHeaders =
+    /\b(STATE|PR|ACTION|TARGET|BLOCKER|GATE):\S+/i.test(message) ||
+    /\[(PR|STATE|ACTION|TARGET|BLOCKER|GATE|ACK)[:\s]/i.test(message);
+  const wordsOutsideHeaders = message
+    .replace(/\[[^\]]+\]/g, '')
+    .replace(/\b[A-Z]+:\S+/g, '')
+    .trim().split(/\s+/).filter(Boolean).length;
+  if (hasAcpHeaders && wordsOutsideHeaders < 50) return 'acp/1';
+  if (hasAcpHeaders) return 'mixed';
+  return 'natural';
+}
+
+/**
+ * Stop hook: on thread-close detection, emit ACP metrics to
+ * ~/.clan/learnings/acp-metrics.jsonl + POST /api/metrics/acp.
+ *
+ * Best-effort metrics — messageCount/timeToResolution are based on the
+ * transcript, not Discord history. Loops/humans counted from the
+ * last_assistant_message alone (post-hoc thread reconstruction is out
+ * of scope for this hook).
+ */
+function createACPMetricsHook(agentName?: string): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+    const message = evt.last_assistant_message;
+    if (!message) return {};
+
+    const outcome = detectThreadClose(message);
+    if (!outcome) return {};
+
+    const protocol = detectProtocol(message);
+
+    // Extract @mentioned agents from message
+    const agentPattern = /@(geordi|data|freeman|motoko)\b/gi;
+    const mentioned = new Set<string>();
+    if (agentName) mentioned.add(agentName);
+    for (const m of message.matchAll(agentPattern)) mentioned.add(m[1].toLowerCase());
+
+    // Extract threadId — prefer [thread:ID], fall back to sessionId
+    const threadMatch = message.match(/\[thread:([^\]]+)\]/i);
+    const threadId = threadMatch?.[1] || evt.session_id;
+
+    // Crude estimates — transcript-derived values would be better but
+    // require parsing the session jsonl which is costly per hook fire.
+    const messageCount = 0; // caller can enrich later
+    const timeToResolutionMin = 0; // unknown from single message
+    const loopsDetected = 0;
+    const humanInterventions = /@stevie\b/i.test(message) ? 1 : 0;
+
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+
+    const metric: ACPMetrics = {
+      threadId,
+      protocol,
+      messageCount,
+      agentsInvolved: Array.from(mentioned),
+      timeToResolutionMin,
+      loopsDetected,
+      humanInterventions,
+      outcome,
+      project: config?.project,
+      clan: config?.clan,
+      harness: 'nanoclaw',
+      ts: new Date().toISOString(),
+    };
+
+    // Persist locally to shared clan store
+    try {
+      const metricsPath = path.join(
+        process.env.HOME || '~',
+        '.clan',
+        'learnings',
+        'acp-metrics.jsonl',
+      );
+      fs.mkdirSync(path.dirname(metricsPath), { recursive: true });
+      fs.appendFileSync(metricsPath, JSON.stringify(metric) + '\n');
+    } catch (err) {
+      log(`ACP-metrics local persist failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Post to Convex (fire-and-forget)
+    if (config) {
+      await postMetric(config.convexUrl, metric);
+    }
+
+    log(`ACP-metrics: thread-close detected (outcome=${outcome}, protocol=${protocol}, agents=${metric.agentsInvolved.length})`);
     return {};
   };
 }
@@ -1229,7 +1448,7 @@ async function runQuery(
           { hooks: [createSessionRulesHook()] },
         ],
         SessionStart: [
-          { hooks: [createManifestContextHook()] },
+          { hooks: [createManifestContextHook(containerInput.assistantName)] },
         ],
         Stop: [
           {
@@ -1238,6 +1457,7 @@ async function runQuery(
               createLearningSyncHook(containerInput.assistantName),
               createLearningVerifierHook(),
               createConvexEventHook(containerInput.assistantName),
+              createACPMetricsHook(containerInput.assistantName),
             ],
           },
         ],
