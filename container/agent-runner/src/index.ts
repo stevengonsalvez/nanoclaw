@@ -32,6 +32,7 @@ import {
   pollInbox,
   prioritizeItems,
 } from './inbox/convex-client.js';
+import { readRecentDiscoveries } from './inbox/discoveries.js';
 
 interface ContainerInput {
   prompt: string;
@@ -363,26 +364,12 @@ function createManifestContextHook(agentName?: string): HookCallback {
     }
 
     // Discovery gossip — last 20 entries from shared discoveries.jsonl
-    const discoveriesPath = path.join(
-      process.env.HOME || '~',
-      '.clan',
-      'learnings',
-      'discoveries.jsonl',
-    );
-    if (fs.existsSync(discoveriesPath)) {
-      try {
-        const lines = fs
-          .readFileSync(discoveriesPath, 'utf-8')
-          .split('\n')
-          .filter((l) => l.trim())
-          .slice(-20);
-        if (lines.length > 0) {
-          parts.push(
-            '# Recent Discoveries (last 20 — non-obvious findings from the fleet)\n' +
-              lines.join('\n'),
-          );
-        }
-      } catch { /* ignore */ }
+    const recentDiscoveries = readRecentDiscoveries(20);
+    if (recentDiscoveries.length > 0) {
+      parts.push(
+        '# Recent Discoveries (last 20 — non-obvious findings from the fleet)\n' +
+          recentDiscoveries.join('\n'),
+      );
     }
 
     // Resume-from-inbox — poll Convex for pending items targeting this agent.
