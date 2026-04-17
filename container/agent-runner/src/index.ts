@@ -329,7 +329,7 @@ function createSessionRulesHook(): HookCallback {
  * SessionStart hook: inject manifest context and cross-agent learnings
  * on the first turn of a new session.
  */
-function createManifestContextHook(): HookCallback {
+function createManifestContextHook(agentName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as SessionStartHookInput;
     const parts: string[] = [];
@@ -360,6 +360,57 @@ function createManifestContextHook(): HookCallback {
           ? '...(truncated)\n' + content.slice(-2000)
           : content;
       parts.push('# Cross-Agent Learnings\n' + trimmed);
+    }
+
+    // Discovery gossip — last 20 entries from shared discoveries.jsonl
+    const discoveriesPath = path.join(
+      process.env.HOME || '~',
+      '.clan',
+      'learnings',
+      'discoveries.jsonl',
+    );
+    if (fs.existsSync(discoveriesPath)) {
+      try {
+        const lines = fs
+          .readFileSync(discoveriesPath, 'utf-8')
+          .split('\n')
+          .filter((l) => l.trim())
+          .slice(-20);
+        if (lines.length > 0) {
+          parts.push(
+            '# Recent Discoveries (last 20 — non-obvious findings from the fleet)\n' +
+              lines.join('\n'),
+          );
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Resume-from-inbox — poll Convex for pending items targeting this agent.
+    // Inbox is the source of truth; Discord is notification. On session start
+    // we check inbox FIRST before reading chat scrollback so the agent resumes
+    // pending work even if Discord notifications were missed.
+    try {
+      const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+      const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+      if (config && config.agent !== 'unknown') {
+        const items = await pollInbox(config);
+        const prioritized = prioritizeItems(items);
+        if (prioritized.length > 0) {
+          const summary = prioritized.slice(0, 10).map((item, idx) => {
+            const labels = (item.labels || []).join(',') || 'routine';
+            return `${idx + 1}. [${labels}] ${item._id} — ${item.title}`;
+          });
+          parts.push(
+            '# Pending Inbox Items (resume-from-inbox on session start)\n' +
+              `You have ${prioritized.length} pending inbox item(s). Read them first before any Discord chatter.\n\n` +
+              summary.join('\n') +
+              '\n\nProtocol: ACK → work → complete. sev-1/sev-2 first, then deploy/handoff, then routine.',
+          );
+          log(`Resume-from-inbox: ${prioritized.length} pending item(s) for ${config.agent}`);
+        }
+      }
+    } catch (err) {
+      log(`Resume-from-inbox poll failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
     }
 
     if (parts.length === 0) return {};
@@ -441,6 +492,66 @@ function createInboxEnforcerHook(platform?: string): HookCallback {
       log(
         `Inbox-enforcer: logged violation — ${mentions.length} mention(s) without [inbox:ID]`,
       );
+    }
+
+    // Content validation: if the message contains inbox-creation intent
+    // (natural language like "create inbox item", "filing inbox", or a
+    // structured announcement pattern), validate required fields are
+    // present. Required: subject, targetAgent (agent name or "mortal"),
+    // and either issueRef or explicit "no-issue" justification.
+    const creationIntent =
+      /\b(create|creating|filed?|filing|new)\s+inbox\s+(item|task|request)/i.test(
+        message,
+      ) ||
+      /\binbox:\s*(new|create)/i.test(message) ||
+      /\b(targetAgent|target_agent|target):\s*(geordi|data|freeman|motoko|mortal)/i.test(
+        message,
+      );
+
+    if (creationIntent) {
+      const missing: string[] = [];
+      // Check for subject/title line
+      if (
+        !/\b(subject|title|task):\s*\S/i.test(message) &&
+        !/\binbox-item:\s*\S/i.test(message)
+      ) {
+        missing.push('subject');
+      }
+      // Check for targetAgent
+      if (
+        !/\b(targetAgent|target_agent|target|to)\s*[:=]\s*(geordi|data|freeman|motoko|mortal)/i.test(
+          message,
+        )
+      ) {
+        missing.push('targetAgent');
+      }
+      // Check for issueRef (or explicit no-issue/bug-fix/config disclaimer)
+      const hasIssueRef = /\b\S+\/\S+#\d+\b/.test(message);
+      const noIssueJustified =
+        /\b(no[-\s]?issue|bug[-\s]?fix|config|docs|no\s+issue\s+needed)\b/i.test(
+          message,
+        );
+      if (!hasIssueRef && !noIssueJustified) {
+        missing.push('issueRef (or explicit no-issue justification)');
+      }
+
+      if (missing.length > 0) {
+        const violation = {
+          ts: new Date().toISOString(),
+          sessionId: evt.session_id,
+          messagePreview: message.slice(0, 300),
+          type: 'incomplete-inbox-content',
+          missingFields: missing,
+          platform: plat || 'unknown',
+        };
+        const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
+        const dir = path.dirname(violationsPath);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.appendFileSync(violationsPath, JSON.stringify(violation) + '\n');
+        log(
+          `Inbox-enforcer: content violation — inbox creation intent missing ${missing.join(', ')}`,
+        );
+      }
     }
 
     return {};
@@ -1229,7 +1340,7 @@ async function runQuery(
           { hooks: [createSessionRulesHook()] },
         ],
         SessionStart: [
-          { hooks: [createManifestContextHook()] },
+          { hooks: [createManifestContextHook(containerInput.assistantName)] },
         ],
         Stop: [
           {
