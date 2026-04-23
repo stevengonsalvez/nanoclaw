@@ -760,6 +760,49 @@ function createConvexEventHook(agentName?: string): HookCallback {
 }
 
 /**
+ * Emit a Fleet Lambda lifecycle event (session:start / session:end) to
+ * Convex. Mirrors Hermes' wololo-events handler.py: fire-and-forget, 3s
+ * timeout, never throws. Loads convex config lazily from the group's
+ * agent-config.yaml so the same helper works for both native and
+ * container runs.
+ *
+ * @param type       Event kind — session:start at runner boot, session:end at shutdown.
+ * @param agentName  Agent display id (e.g. 'geordi'). Derived from identity.md if omitted.
+ * @param sessionId  Current query sessionId, or undefined at boot before the SDK picks one.
+ * @param extra      Optional metadata (e.g. exit reason) merged into the event.data payload.
+ */
+async function fireLifecycleEvent(
+  type: 'session:start' | 'session:end',
+  agentName: string | undefined,
+  sessionId: string | undefined,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+    if (!config) return;
+
+    await postEvent(config.convexUrl, {
+      type,
+      agent: config.agent,
+      project: config.project,
+      clan: config.clan,
+      data: {
+        sessionId: sessionId || '',
+        source: 'nanoclaw',
+        runtime: process.env.NANOCLAW_RUNTIME || 'native',
+        ...extra,
+      },
+    });
+  } catch (err) {
+    // Never block the pipeline on lifecycle telemetry.
+    log(
+      `Lifecycle event ${type} failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Detect thread-close intent from the last assistant message.
  * Returns the detected outcome, or null if not a close.
  */
@@ -1599,6 +1642,19 @@ async function main(): Promise<void> {
     log(`Discovered ${skillHooks.length} skill(s) with hook declarations`);
   }
 
+  // P2: Fleet Lambda lifecycle event — emitted once at runner boot.
+  // Fire-and-forget; the helper swallows errors and the 3s HTTP timeout
+  // cannot stall the agent pipeline.
+  await fireLifecycleEvent(
+    'session:start',
+    containerInput.assistantName,
+    containerInput.sessionId,
+    {
+      isScheduledTask: !!containerInput.isScheduledTask,
+      hasScript: !!containerInput.script,
+    },
+  );
+
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = {
@@ -1654,6 +1710,10 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  // P2: Capture the exit reason so session:end carries useful context.
+  let exitReason: 'close-during-query' | 'close-sentinel' | 'error' | 'loop-exit' =
+    'loop-exit';
+
   try {
     while (true) {
       log(
@@ -1680,6 +1740,7 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        exitReason = 'close-during-query';
         break;
       }
 
@@ -1699,6 +1760,7 @@ async function main(): Promise<void> {
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
+        exitReason = 'close-sentinel';
         break;
       }
 
@@ -1706,8 +1768,16 @@ async function main(): Promise<void> {
       prompt = nextMessage;
     }
   } catch (err) {
+    exitReason = 'error';
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    // P2: emit session:end with error context before exiting.
+    await fireLifecycleEvent(
+      'session:end',
+      containerInput.assistantName,
+      sessionId,
+      { exitReason, error: errorMessage },
+    );
     writeOutput({
       status: 'error',
       result: null,
@@ -1716,6 +1786,14 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  // P2: Normal shutdown path — covers `break` exits above.
+  await fireLifecycleEvent(
+    'session:end',
+    containerInput.assistantName,
+    sessionId,
+    { exitReason },
+  );
 }
 
 main();
