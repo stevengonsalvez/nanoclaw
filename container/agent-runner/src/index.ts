@@ -1167,6 +1167,35 @@ async function runSelfReflection(sessionId: string | undefined): Promise<void> {
   fs.writeFileSync(correctionsPath, correctionsContent);
   log(`Self-reflection: logged ${detectedCorrections.length} correction(s)`);
 
+  // P3: Stream each correction to pending-corrections.jsonl for downstream
+  // consumers (fleet dashboards, agent-state-collector currentTask, etc.).
+  // Schema is stable and shared with Hermes' inbox-enforcer hook so the
+  // mission-control UI can render Hermes + NanoClaw signals uniformly.
+  //
+  // Append-only, line-delimited JSON. Any failure here is non-fatal — we
+  // already wrote the authoritative corrections.md record above.
+  try {
+    const pendingPath = `${dir}/pending-corrections.jsonl`;
+    const agentTag = WORKSPACE_GROUP.split('/').filter(Boolean).pop() || 'unknown';
+    const lines = detectedCorrections
+      .map((correction) =>
+        JSON.stringify({
+          ts: now.toISOString(),
+          agent: agentTag,
+          user_message_snippet: correction.text.slice(0, 200),
+          corrected_behavior: 'pending-review',
+          signal_strength: correction.tier,
+          session_id: sessionId || '',
+        }),
+      )
+      .join('\n') + '\n';
+    fs.appendFileSync(pendingPath, lines);
+  } catch (err) {
+    log(
+      `Self-reflection: pending-corrections append failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   // Pattern promotion: count similar corrections. If 3+ pending, promote to memory.
   const pendingCount = (correctionsContent.match(/\*\*Status:\*\* pending-review/g) || []).length;
   if (pendingCount >= 3) {
