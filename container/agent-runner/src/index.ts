@@ -328,6 +328,297 @@ function createSessionRulesHook(): HookCallback {
   };
 }
 
+// P5: first-turn cache — we only want to perform the repo-manifest lookup
+// once per session, not on every user prompt.
+const _repoManifestSeenSessions: Set<string> = new Set();
+
+// P5: keyword routing lifted from agent-config.yaml's repo_routing block.
+// Cached after the first successful load so we don't re-parse per turn.
+let _repoRoutingCache: {
+  loadedFrom: string;
+  defaultRepo: string;
+  routing: Array<{ repo: string; match: string[] }>;
+} | null = null;
+
+/**
+ * Return the agent-config.yaml repo_routing table in a structured form.
+ *
+ * The runner already uses `loadConvexConfig` for the three keys it cares
+ * about; for routing we need the nested repo_routing block, which is a
+ * minimal multi-line YAML shape:
+ *
+ *   repo_routing:
+ *     app:
+ *       repo: org/repo
+ *       match: [keyword, phrase]
+ *
+ * We parse it by hand (same pattern as loadConvexConfig) to avoid pulling
+ * in a YAML dependency.
+ */
+function loadRepoRouting(agentConfigPath: string): typeof _repoRoutingCache {
+  if (_repoRoutingCache && _repoRoutingCache.loadedFrom === agentConfigPath) {
+    return _repoRoutingCache;
+  }
+  if (!fs.existsSync(agentConfigPath)) return null;
+
+  const raw = fs.readFileSync(agentConfigPath, 'utf-8');
+  const lines = raw.split('\n');
+  const routing: Array<{ repo: string; match: string[] }> = [];
+
+  let inRouting = false;
+  let inRoutingKey = false;
+  let currentRepo = '';
+  let currentMatch: string[] = [];
+
+  const pushCurrent = () => {
+    if (currentRepo) {
+      routing.push({ repo: currentRepo, match: currentMatch });
+    }
+    currentRepo = '';
+    currentMatch = [];
+  };
+
+  let defaultRepo = '';
+  for (const line of lines) {
+    if (/^default_repo:\s*(.+)$/.test(line)) {
+      defaultRepo = line
+        .replace(/^default_repo:\s*/, '')
+        .trim()
+        .replace(/^["']|["']$/g, '');
+      continue;
+    }
+    if (/^repo_routing:\s*$/.test(line)) {
+      inRouting = true;
+      continue;
+    }
+    if (inRouting) {
+      // Top-level key ends the block (un-indented non-empty line).
+      if (/^[A-Za-z_]/.test(line)) {
+        pushCurrent();
+        inRouting = false;
+        inRoutingKey = false;
+        continue;
+      }
+      // Two-space indent starts a new routing key (app:, dashboard:, etc.).
+      if (/^ {2}[A-Za-z0-9_-]+:\s*$/.test(line)) {
+        pushCurrent();
+        inRoutingKey = true;
+        continue;
+      }
+      if (inRoutingKey) {
+        const repoMatch = line.match(/^ {4}repo:\s*(.+)$/);
+        if (repoMatch) {
+          currentRepo = repoMatch[1].trim().replace(/^["']|["']$/g, '');
+          continue;
+        }
+        const matchMatch = line.match(/^ {4}match:\s*\[(.+)\]\s*$/);
+        if (matchMatch) {
+          currentMatch = matchMatch[1]
+            .split(',')
+            .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+            .filter(Boolean);
+          continue;
+        }
+      }
+    }
+  }
+  pushCurrent();
+
+  _repoRoutingCache = { loadedFrom: agentConfigPath, defaultRepo, routing };
+  return _repoRoutingCache;
+}
+
+/** Detect a coarse task_type from the user message, mirroring Hermes. */
+function detectTaskType(message: string): 'test' | 'review' | 'ops' | 'build' {
+  const lower = message.toLowerCase();
+  if (/\b(test|qa|e2e|verify|check|validate|assert)\b/.test(lower)) return 'test';
+  if (/\b(review|approve|audit|inspect|assess|pr)\b/.test(lower)) return 'review';
+  if (/\b(deploy|infra|ci|cd|pipeline|ops|monitor|scale|cron|sre)\b/.test(lower))
+    return 'ops';
+  return 'build';
+}
+
+/** Score repo_routing entries against a prompt; return the best repo slug. */
+function matchRepoFromPrompt(
+  prompt: string,
+  routing: ReturnType<typeof loadRepoRouting>,
+): string {
+  if (!routing) return '';
+  const lower = prompt.toLowerCase();
+  let bestScore = 0;
+  let bestRepo = '';
+  for (const entry of routing.routing) {
+    const score = entry.match.reduce(
+      (acc, kw) => acc + (kw && lower.includes(kw.toLowerCase()) ? 1 : 0),
+      0,
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      bestRepo = entry.repo;
+    }
+  }
+  return bestRepo || routing.defaultRepo;
+}
+
+/** Locate a local checkout of <org>/<repo> by probing conventional paths. */
+function findLocalRepoPath(repoSlug: string): string | null {
+  if (!repoSlug) return null;
+  const home = process.env.HOME || '';
+  const leaf = repoSlug.split('/').pop() || '';
+  if (!home || !leaf) return null;
+  const candidates = [
+    path.join(home, 'd', 'git', leaf),
+    path.join(home, 'd', leaf),
+    path.join(home, 'repos', leaf),
+    path.join(home, leaf),
+    path.join(home, '.agents-in-a-box', 'repos', 'github.com', ...repoSlug.toLowerCase().split('/')),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/**
+ * Load <repo>/.clan/manifest.yaml (raw text), then pick the relevant context
+ * files based on task_type. Returns a single injectable context blob, or
+ * empty string when the manifest (and AGENTS.md fallback) are missing.
+ */
+function loadRepoManifestContext(
+  repoDir: string,
+  taskType: 'test' | 'review' | 'ops' | 'build',
+): string {
+  const manifestPath = path.join(repoDir, '.clan', 'manifest.yaml');
+  if (!fs.existsSync(manifestPath)) {
+    const agentsMd = path.join(repoDir, 'AGENTS.md');
+    if (fs.existsSync(agentsMd)) {
+      try {
+        const content = fs.readFileSync(agentsMd, 'utf-8').slice(0, 5000);
+        return `## Repo Context (AGENTS.md fallback) — ${path.basename(repoDir)}\n\n${content}`;
+      } catch {
+        return '';
+      }
+    }
+    return '';
+  }
+
+  let manifestRaw: string;
+  try {
+    manifestRaw = fs.readFileSync(manifestPath, 'utf-8');
+  } catch {
+    return '';
+  }
+
+  // Extract context.always and context.<taskType> file lists. The manifest
+  // shape is YAML like:
+  //   context:
+  //     always: [path1, path2]
+  //     test: [path3]
+  // but it can also use indented list form. We support both without pulling
+  // in a YAML parser — regex covers the concrete files in-use today.
+  const wantedTypes = ['always', taskType];
+  const filesToLoad: string[] = [];
+
+  for (const key of wantedTypes) {
+    // Inline array form:  <key>: [a, b, c]
+    const inline = manifestRaw.match(
+      new RegExp(`^ {2,4}${key}\\s*:\\s*\\[([^\\]]+)\\]`, 'm'),
+    );
+    if (inline) {
+      filesToLoad.push(
+        ...inline[1]
+          .split(',')
+          .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+          .filter(Boolean),
+      );
+      continue;
+    }
+    // Indented list form:  <key>:\n    - path\n    - path
+    const blockStart = manifestRaw.match(
+      new RegExp(`^ {2,4}${key}\\s*:\\s*$`, 'm'),
+    );
+    if (!blockStart || blockStart.index === undefined) continue;
+    const blockBody = manifestRaw
+      .slice(blockStart.index + blockStart[0].length)
+      .split('\n');
+    for (const line of blockBody) {
+      if (!line.trim()) continue;
+      const m = line.match(/^\s*-\s*(.+)$/);
+      if (!m) break;
+      filesToLoad.push(m[1].trim().replace(/^["']|["']$/g, ''));
+    }
+  }
+
+  const parts: string[] = [];
+  parts.push(`## Project Context (.clan/) — ${path.basename(repoDir)}`);
+  parts.push(`## Task type: ${taskType}`);
+  parts.push(`## Repo: ${repoDir}`);
+  const loaded: string[] = [];
+  for (const rel of filesToLoad) {
+    const full = path.join(repoDir, rel);
+    if (!fs.existsSync(full)) continue;
+    try {
+      const content = fs.readFileSync(full, 'utf-8').slice(0, 8000);
+      loaded.push(rel);
+      parts.push(`\n--- ${rel} ---\n${content}`);
+    } catch {
+      /* skip unreadable */
+    }
+  }
+  if (loaded.length === 0) return '';
+  parts.splice(3, 0, `## Files loaded: ${loaded.join(', ')}`);
+  return parts.join('\n');
+}
+
+/**
+ * UserPromptSubmit hook (P5): on the first turn of a session, scan the
+ * user prompt for repo keywords declared in agent-config.yaml's
+ * repo_routing block. When a match is found, load the target repo's
+ * .clan/manifest.yaml and return task-type-appropriate context files
+ * (falling back to AGENTS.md).
+ *
+ * Mirrors Hermes' manifest_context.py hook — same repo_routing format,
+ * same task_type taxonomy, same fallback chain — so a single
+ * .clan/manifest.yaml works for both harnesses.
+ */
+function createRepoManifestContextHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as UserPromptSubmitHookInput;
+    const sessionId = evt.session_id;
+    if (_repoManifestSeenSessions.has(sessionId)) return {};
+    _repoManifestSeenSessions.add(sessionId);
+
+    const prompt = evt.prompt || '';
+    if (!prompt.trim()) return {};
+
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    const routing = loadRepoRouting(agentConfigPath);
+    if (!routing) return {};
+
+    const repoSlug = matchRepoFromPrompt(prompt, routing);
+    if (!repoSlug) return {};
+
+    const repoDir = findLocalRepoPath(repoSlug);
+    if (!repoDir) return {};
+
+    const taskType = detectTaskType(prompt);
+    const context = loadRepoManifestContext(repoDir, taskType);
+    if (!context) return {};
+
+    log(`Repo-manifest: injected ${taskType} context for ${repoSlug} from ${repoDir}`);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit' as const,
+        additionalContext: context,
+      },
+    };
+  };
+}
+
 /**
  * SessionStart hook: inject manifest context and cross-agent learnings
  * on the first turn of a new session.
@@ -760,6 +1051,49 @@ function createConvexEventHook(agentName?: string): HookCallback {
 }
 
 /**
+ * Emit a Fleet Lambda lifecycle event (session:start / session:end) to
+ * Convex. Mirrors Hermes' wololo-events handler.py: fire-and-forget, 3s
+ * timeout, never throws. Loads convex config lazily from the group's
+ * agent-config.yaml so the same helper works for both native and
+ * container runs.
+ *
+ * @param type       Event kind — session:start at runner boot, session:end at shutdown.
+ * @param agentName  Agent display id (e.g. 'geordi'). Derived from identity.md if omitted.
+ * @param sessionId  Current query sessionId, or undefined at boot before the SDK picks one.
+ * @param extra      Optional metadata (e.g. exit reason) merged into the event.data payload.
+ */
+async function fireLifecycleEvent(
+  type: 'session:start' | 'session:end',
+  agentName: string | undefined,
+  sessionId: string | undefined,
+  extra: Record<string, unknown> = {},
+): Promise<void> {
+  try {
+    const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
+    const config = loadConvexConfig(agentConfigPath, agentName || 'unknown');
+    if (!config) return;
+
+    await postEvent(config.convexUrl, {
+      type,
+      agent: config.agent,
+      project: config.project,
+      clan: config.clan,
+      data: {
+        sessionId: sessionId || '',
+        source: 'nanoclaw',
+        runtime: process.env.NANOCLAW_RUNTIME || 'native',
+        ...extra,
+      },
+    });
+  } catch (err) {
+    // Never block the pipeline on lifecycle telemetry.
+    log(
+      `Lifecycle event ${type} failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Detect thread-close intent from the last assistant message.
  * Returns the detected outcome, or null if not a close.
  */
@@ -1124,6 +1458,35 @@ async function runSelfReflection(sessionId: string | undefined): Promise<void> {
   fs.writeFileSync(correctionsPath, correctionsContent);
   log(`Self-reflection: logged ${detectedCorrections.length} correction(s)`);
 
+  // P3: Stream each correction to pending-corrections.jsonl for downstream
+  // consumers (fleet dashboards, agent-state-collector currentTask, etc.).
+  // Schema is stable and shared with Hermes' inbox-enforcer hook so the
+  // mission-control UI can render Hermes + NanoClaw signals uniformly.
+  //
+  // Append-only, line-delimited JSON. Any failure here is non-fatal — we
+  // already wrote the authoritative corrections.md record above.
+  try {
+    const pendingPath = `${dir}/pending-corrections.jsonl`;
+    const agentTag = WORKSPACE_GROUP.split('/').filter(Boolean).pop() || 'unknown';
+    const lines = detectedCorrections
+      .map((correction) =>
+        JSON.stringify({
+          ts: now.toISOString(),
+          agent: agentTag,
+          user_message_snippet: correction.text.slice(0, 200),
+          corrected_behavior: 'pending-review',
+          signal_strength: correction.tier,
+          session_id: sessionId || '',
+        }),
+      )
+      .join('\n') + '\n';
+    fs.appendFileSync(pendingPath, lines);
+  } catch (err) {
+    log(
+      `Self-reflection: pending-corrections append failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   // Pattern promotion: count similar corrections. If 3+ pending, promote to memory.
   const pendingCount = (correctionsContent.match(/\*\*Status:\*\* pending-review/g) || []).length;
   if (pendingCount >= 3) {
@@ -1445,7 +1808,15 @@ async function runQuery(
           { hooks: [createPreCompactHook(containerInput.assistantName)] },
         ],
         UserPromptSubmit: [
-          { hooks: [createSessionRulesHook()] },
+          {
+            hooks: [
+              createSessionRulesHook(),
+              // P5: per-repo manifest lookup — first-turn only, matches
+              // user prompt against agent-config.yaml's repo_routing and
+              // injects .clan/manifest.yaml context from the target repo.
+              createRepoManifestContextHook(),
+            ],
+          },
         ],
         SessionStart: [
           { hooks: [createManifestContextHook(containerInput.assistantName)] },
@@ -1599,6 +1970,19 @@ async function main(): Promise<void> {
     log(`Discovered ${skillHooks.length} skill(s) with hook declarations`);
   }
 
+  // P2: Fleet Lambda lifecycle event — emitted once at runner boot.
+  // Fire-and-forget; the helper swallows errors and the 3s HTTP timeout
+  // cannot stall the agent pipeline.
+  await fireLifecycleEvent(
+    'session:start',
+    containerInput.assistantName,
+    containerInput.sessionId,
+    {
+      isScheduledTask: !!containerInput.isScheduledTask,
+      hasScript: !!containerInput.script,
+    },
+  );
+
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = {
@@ -1654,6 +2038,10 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  // P2: Capture the exit reason so session:end carries useful context.
+  let exitReason: 'close-during-query' | 'close-sentinel' | 'error' | 'loop-exit' =
+    'loop-exit';
+
   try {
     while (true) {
       log(
@@ -1680,6 +2068,7 @@ async function main(): Promise<void> {
       // idle timer and cause a 30-min delay before the next _close).
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
+        exitReason = 'close-during-query';
         break;
       }
 
@@ -1699,6 +2088,7 @@ async function main(): Promise<void> {
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
         log('Close sentinel received, exiting');
+        exitReason = 'close-sentinel';
         break;
       }
 
@@ -1706,8 +2096,16 @@ async function main(): Promise<void> {
       prompt = nextMessage;
     }
   } catch (err) {
+    exitReason = 'error';
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    // P2: emit session:end with error context before exiting.
+    await fireLifecycleEvent(
+      'session:end',
+      containerInput.assistantName,
+      sessionId,
+      { exitReason, error: errorMessage },
+    );
     writeOutput({
       status: 'error',
       result: null,
@@ -1716,6 +2114,14 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  // P2: Normal shutdown path — covers `break` exits above.
+  await fireLifecycleEvent(
+    'session:end',
+    containerInput.assistantName,
+    sessionId,
+    { exitReason },
+  );
 }
 
 main();
