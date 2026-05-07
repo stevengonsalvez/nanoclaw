@@ -1,4 +1,5 @@
 {
+  "schemaVersion": 2,
   "correctionSignals": {
     "strong": [
       "no, ", "no that's", "no thats", "wrong", "actually,", "actually ",
@@ -19,10 +20,59 @@
       "hmm", "not quite", "close but", "almost", "not exactly", "sort of"
     ]
   },
+  "validationSignals": {
+    "strong": [
+      "exactly right", "exactly that", "that's it", "thats it",
+      "you got it", "spot on", "spot-on", "nailed it",
+      "yes! like that", "yes thats right", "yes that's right",
+      "lgtm", "ship it"
+    ],
+    "medium": [
+      "great job", "well done", "good work", "approved",
+      "looks correct", "this works", "this is right"
+    ]
+  },
+  "knowledgeSignals": {
+    "root_cause": [
+      "root cause was", "the issue was", "the bug was",
+      "turns out", "figured out", "found it",
+      "the problem was"
+    ],
+    "fix_confirmed": [
+      "fixed by", "the solution was", "resolved by", "solved by",
+      "the fix was", "got it working"
+    ],
+    "docs_vs_reality": [
+      "docs say", "undocumented", "misleading error",
+      "the docs are wrong"
+    ]
+  },
+  "frustrationMarkers": [
+    "i already told you", "again?", "not again",
+    "how many times", "you keep doing"
+  ],
+  "negationGuards": [
+    "not ", "didn't ", "doesn't ", "isn't ", "wasn't ", "weren't ",
+    "haven't ", "hasn't ", "wouldn't ", "won't ", "can't ", "couldn't ",
+    "never "
+  ],
   "excludePatterns": [
     "no worries", "no problem", "no rush", "no need", "no thanks",
     "actually good", "actually great", "actually perfect",
-    "stop me if", "wrong channel"
+    "stop me if", "wrong channel",
+    "session is about to",
+    "automatically reset",
+    "safe to resume",
+    "should be safe to",
+    "system reminder"
+  ],
+  "excludeContextMarkers": [
+    "system:",
+    "<system-reminder>",
+    "</system-reminder>",
+    "[CORRECTION-DETECTOR]",
+    "system-init",
+    "Fleet Lambda initialized"
   ],
   "minimumConfidence": "medium",
   "agentNames": ["geordi", "data", "freeman", "motoko"]

@@ -247,6 +247,42 @@ export async function postMetric(
 }
 
 /**
+ * Cross-fleet violation record posted to /api/violations/report on
+ * circuit-breaker open, content-validation failure, etc. Schema mirrors
+ * the Hermes mc_client.post() payload so the receiver is fleet-agnostic.
+ */
+export interface ViolationRecord {
+  agent: string;
+  clan: string;
+  ruleId: string;
+  description: string;
+  severity: 'warning' | 'violation';
+  snippet?: string;
+  ts?: string;
+}
+
+/**
+ * Post a violation to mission-control. Fire-and-forget, logs failures.
+ */
+export async function postViolation(
+  convexUrl: string,
+  violation: ViolationRecord,
+): Promise<void> {
+  violation.ts = violation.ts || new Date().toISOString();
+  try {
+    await fetchWithTimeout(`${convexUrl}/api/violations/report`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(violation),
+    });
+  } catch (err) {
+    console.error(
+      `[convex-client] Failed to post violation: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Prioritize inbox items per Fleet Lambda protocol:
  * 1. sev-1, sev-2 (incidents — immediate)
  * 2. deploy, handoff (partner handoff)

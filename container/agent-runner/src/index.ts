@@ -35,6 +35,15 @@ import {
   ACPMetrics,
 } from './inbox/convex-client.js';
 import { readRecentDiscoveries } from './inbox/discoveries.js';
+import * as circuitBreaker from './inbox/circuit-breaker.js';
+import * as correctionDetector from './inbox/correction-detector.js';
+import * as injectionHistory from './inbox/injection-history.js';
+import {
+  queryBank,
+  extractKeywords,
+  formatBankContext,
+} from './inbox/bank-query.js';
+import crypto from 'crypto';
 
 interface ContainerInput {
   prompt: string;
@@ -616,6 +625,110 @@ function createRepoManifestContextHook(): HookCallback {
         additionalContext: context,
       },
     };
+  };
+}
+
+/**
+ * UserPromptSubmit hook: BANK retrieval. Mirrors Hermes bank_lookup —
+ * extracts keywords from the prompt, queries ~/.clan/learnings/bank.db
+ * via the bank-query shim, and injects the formatted context block.
+ *
+ * Records the injection into injection-history so correction-detector
+ * can attribute later corrections / validations to specific BANK rows
+ * (the Pass 5/7 confirmed_count signal).
+ *
+ * Failures are silent — an unreachable index never blocks a turn.
+ */
+function createBankLookupHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as UserPromptSubmitHookInput;
+    const prompt = (evt.prompt || '').trim();
+    if (!prompt) return {};
+
+    const keywords = extractKeywords(prompt);
+    if (keywords.length === 0) return {};
+
+    const hits = queryBank(keywords.join(' '));
+    if (hits.length === 0) return {};
+
+    const additionalContext = formatBankContext(hits, keywords);
+    if (!additionalContext) return {};
+
+    // Record this injection so correction-detector can build the
+    // correction-after-injection / validation-after-injection joins.
+    const injectionId = `inj-${crypto.randomBytes(6).toString('hex')}`;
+    const hitIds = hits.map((h) => h.id || '').filter((id) => !!id);
+    injectionHistory.record(evt.session_id, injectionId, hitIds);
+
+    log(`BANK: injected ${hits.length} hit(s) for keywords [${keywords.slice(0, 3).join(', ')}…]`);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit' as const,
+        additionalContext,
+      },
+    };
+  };
+}
+
+/**
+ * UserPromptSubmit hook: correction-detector pre-pass. Scans the user
+ * message for correction / validation / knowledge / frustration signals
+ * and routes per-class to shared cross-fleet JSONLs (corrections-raw,
+ * validations, discoveries) + the local pending-corrections ledger.
+ *
+ * Returns no additionalContext — the LLM is no longer responsible for
+ * formatting (Hermes Pass 2 Fix 1). Finalisation happens on Stop.
+ */
+function createCorrectionDetectorPreHook(agentName?: string): HookCallback {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const signalsPath = path.join(__dirname, 'signals.json');
+  return async (input, _toolUseId, _context) => {
+    const evt = input as UserPromptSubmitHookInput;
+    correctionDetector.onUserPromptSubmit(evt.session_id, evt.prompt || '', {
+      signalsPath,
+      workspaceGroup: WORKSPACE_GROUP,
+      agent: agentName || 'unknown',
+      platform: process.env.NANOCLAW_PLATFORM || '',
+    });
+    return {};
+  };
+}
+
+/**
+ * Stop hook: correction-detector post-pass. Finalises any pending
+ * correction armed in the pre-pass by appending the assistant response
+ * to corrections-raw.jsonl and writing a deterministic entry to
+ * <group>/self-improving/corrections.md (with 60s dedup).
+ */
+function createCorrectionDetectorStopHook(agentName?: string): HookCallback {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const signalsPath = path.join(__dirname, 'signals.json');
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+    correctionDetector.onStop(
+      evt.session_id,
+      evt.last_assistant_message || '',
+      {
+        signalsPath,
+        workspaceGroup: WORKSPACE_GROUP,
+        agent: agentName || 'unknown',
+        platform: process.env.NANOCLAW_PLATFORM || '',
+      },
+    );
+    return {};
+  };
+}
+
+/**
+ * Stop hook: circuit-breaker resume-marker check. If
+ * <group>/self-improving/.resume-after-stuck is present, read it,
+ * delete it, and reset the counter (clearing STUCK.flag). Mirrors
+ * Hermes circuit_breaker.on_post_llm.
+ */
+function createCircuitBreakerHook(): HookCallback {
+  return async (_input, _toolUseId, _context) => {
+    circuitBreaker.checkResumeMarker(WORKSPACE_GROUP);
+    return {};
   };
 }
 
@@ -1815,6 +1928,15 @@ async function runQuery(
               // user prompt against agent-config.yaml's repo_routing and
               // injects .clan/manifest.yaml context from the target repo.
               createRepoManifestContextHook(),
+              // BANK retrieval — every turn, BM25 over shared
+              // ~/.clan/learnings/bank.db. Records each injection into
+              // injection-history for the correction-after-injection join.
+              createBankLookupHook(),
+              // Multi-class signal capture — corrections, validations,
+              // knowledge, frustration. Routes per-class to shared
+              // ~/.clan/learnings/{corrections-raw,validations,discoveries}
+              // and arms post-finalisation in the Stop chain.
+              createCorrectionDetectorPreHook(containerInput.assistantName),
             ],
           },
         ],
@@ -1825,10 +1947,17 @@ async function runQuery(
           {
             hooks: [
               createInboxEnforcerHook(),
+              // Correction-detector finalisation — append assistant
+              // response to corrections-raw + corrections.md (60s dedup).
+              createCorrectionDetectorStopHook(containerInput.assistantName),
               createLearningSyncHook(containerInput.assistantName),
               createLearningVerifierHook(),
               createConvexEventHook(containerInput.assistantName),
               createACPMetricsHook(containerInput.assistantName),
+              // Circuit-breaker resume marker check — if
+              // .resume-after-stuck is present, clear STUCK.flag + reset
+              // the consecutive-failure counter.
+              createCircuitBreakerHook(),
             ],
           },
         ],
@@ -2106,6 +2235,9 @@ async function main(): Promise<void> {
       sessionId,
       { exitReason, error: errorMessage },
     );
+    // Drop fleet-hooks per-session state (correction-detector +
+    // injection-history maps).
+    if (sessionId) correctionDetector.clearSession(sessionId);
     writeOutput({
       status: 'error',
       result: null,
@@ -2122,6 +2254,7 @@ async function main(): Promise<void> {
     sessionId,
     { exitReason },
   );
+  if (sessionId) correctionDetector.clearSession(sessionId);
 }
 
 main();
