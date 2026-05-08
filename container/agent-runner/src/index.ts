@@ -830,15 +830,82 @@ const INBOX_ENFORCER_ACK_PATTERNS = [
   'acknowledged', "ack'd", 'ack', 'got it', 'on it',
 ];
 
-function createInboxEnforcerHook(platform?: string): HookCallback {
+// Curl POST to /api/inbox/{create,send} — captures the JSON payload
+// passed via -d / --data / --data-raw. Mirrors Hermes _INBOX_POST_RE so
+// both fleets enforce the same schema on inbox-create attempts.
+const INBOX_POST_RE =
+  /curl[^\n]*?(?:-X\s+POST[^\n]*?)?\/api\/inbox\/(?:create|send)?\b[^\n]*?(?:--data(?:-raw)?|-d)\s+(['"])(\{[^]*?\})\1/gi;
+const INBOX_PAYLOAD_REQUIRED = ['subject', 'body', 'targetAgent', 'project', 'clan'];
+const INBOX_MIN_SUBJECT = 10;
+const INBOX_MIN_BODY = 50;
+const ISSUE_REF_RE = /^[^/\s]+\/[^/\s]+#\d+$/;
+
+function validateInboxPayloads(message: string): string[] {
+  const violations: string[] = [];
+  const matches = [...message.matchAll(INBOX_POST_RE)];
+  for (const m of matches) {
+    const raw = m[2];
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(raw);
+    } catch (err) {
+      violations.push(`malformed JSON in inbox payload: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    const missing = INBOX_PAYLOAD_REQUIRED.filter((f) => !payload[f]);
+    if (missing.length > 0) {
+      violations.push(`missing required fields: ${missing.join(',')}`);
+      continue;
+    }
+    if (String(payload.subject || '').length < INBOX_MIN_SUBJECT) {
+      violations.push(`subject <${INBOX_MIN_SUBJECT} chars`);
+    }
+    if (String(payload.body || '').length < INBOX_MIN_BODY) {
+      violations.push(`body <${INBOX_MIN_BODY} chars (insufficient context for resume)`);
+    }
+    const kind = String(payload.kind || 'task');
+    const target = String(payload.targetAgent || '');
+    if (kind === 'task' && target !== 'mortal') {
+      const issueRef = String(payload.issueRef || '');
+      if (!issueRef) {
+        violations.push('issueRef required for kind=task and targetAgent!=mortal');
+      } else if (!ISSUE_REF_RE.test(issueRef)) {
+        violations.push(`issueRef '${issueRef}' does not match <owner>/<repo>#<number>`);
+      }
+    }
+  }
+  return violations;
+}
+
+function createInboxEnforcerHook(platform?: string, agentName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
     const message = evt.last_assistant_message;
     if (!message) return {};
 
-    // Platform filter: inbox enforcement only applies to gateway platforms
-    // (Discord, Slack, etc.), not CLI/local runs. Skip if platform is CLI-like.
     const plat = (platform || process.env.NANOCLAW_PLATFORM || '').toLowerCase();
+
+    // Inbox-payload schema validation runs on ALL platforms (bad payloads
+    // are always bad, even from CLI). Mirrors Hermes inbox_enforcer.
+    const payloadViolations = validateInboxPayloads(message);
+    for (const detail of payloadViolations) {
+      const violation = {
+        ts: new Date().toISOString(),
+        agent: agentName || 'unknown',
+        sessionId: evt.session_id,
+        messagePreview: message.slice(0, 300),
+        type: 'invalid-inbox-payload',
+        detail,
+        platform: plat || 'unknown',
+      };
+      const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
+      fs.mkdirSync(path.dirname(violationsPath), { recursive: true });
+      fs.appendFileSync(violationsPath, JSON.stringify(violation) + '\n');
+      log(`Inbox-enforcer: invalid-inbox-payload — ${detail}`);
+    }
+
+    // Platform filter: orphan-mention enforcement only applies to gateway
+    // platforms (Discord, Slack, etc.), not CLI/local runs.
     if (plat === 'cli' || plat === 'local') return {};
 
     const trimmed = message.trim();
@@ -867,6 +934,7 @@ function createInboxEnforcerHook(platform?: string): HookCallback {
     if (mentions && mentions.length > 0 && !inboxPattern.test(message)) {
       const violation = {
         ts: new Date().toISOString(),
+        agent: agentName || 'unknown',
         sessionId: evt.session_id,
         mentions: mentions,
         messagePreview: message.slice(0, 200),
@@ -931,6 +999,7 @@ function createInboxEnforcerHook(platform?: string): HookCallback {
       if (missing.length > 0) {
         const violation = {
           ts: new Date().toISOString(),
+          agent: agentName || 'unknown',
           sessionId: evt.session_id,
           messagePreview: message.slice(0, 300),
           type: 'incomplete-inbox-content',
@@ -1946,7 +2015,7 @@ async function runQuery(
         Stop: [
           {
             hooks: [
-              createInboxEnforcerHook(),
+              createInboxEnforcerHook(undefined, containerInput.assistantName),
               // Correction-detector finalisation — append assistant
               // response to corrections-raw + corrections.md (60s dedup).
               createCorrectionDetectorStopHook(containerInput.assistantName),
