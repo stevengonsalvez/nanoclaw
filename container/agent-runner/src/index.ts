@@ -46,6 +46,11 @@ import {
   buildStrikeIndex,
 } from './inbox/learning-fingerprint.js';
 import {
+  composeUserPromptSubmit as composeFleetHooksUserPromptSubmit,
+  composeStop as composeFleetHooksStop,
+  composeSessionStart as composeFleetHooksSessionStart,
+} from './fleet-hooks-adapter/index.js';
+import {
   queryBank,
   extractKeywords,
   formatBankContext,
@@ -312,7 +317,7 @@ function loadStandingOrders(): void {
  * survive compaction. First turn of each session gets the full document;
  * subsequent turns get only the critical rules to conserve tokens.
  */
-function createSessionRulesHook(): HookCallback {
+export function createSessionRulesHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as UserPromptSubmitHookInput;
     loadStandingOrders();
@@ -670,7 +675,7 @@ function loadRepoManifestContext(
  * same task_type taxonomy, same fallback chain — so a single
  * .clan/manifest.yaml works for both harnesses.
  */
-function createRepoManifestContextHook(): HookCallback {
+export function createRepoManifestContextHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as UserPromptSubmitHookInput;
     const sessionId = evt.session_id;
@@ -1187,7 +1192,7 @@ function isDuplicateSignature(patternsPath: string, signature: string): boolean 
   return false;
 }
 
-function createLearningSyncHook(agentName?: string): HookCallback {
+export function createLearningSyncHook(agentName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
     const sessionId = evt.session_id || '';
@@ -1340,7 +1345,7 @@ function createLearningSyncHook(agentName?: string): HookCallback {
  * hits in 14 days in the Hermes Pass-3 audit and has high false-positive
  * surface.
  */
-function createLearningVerifierHook(): HookCallback {
+export function createLearningVerifierHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
     const sessionId = evt.session_id || '';
@@ -1533,7 +1538,7 @@ function detectProtocol(message: string): ACPMetrics['protocol'] {
  * last_assistant_message alone (post-hoc thread reconstruction is out
  * of scope for this hook).
  */
-function createACPMetricsHook(agentName?: string): HookCallback {
+export function createACPMetricsHook(agentName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
     const message = evt.last_assistant_message;
@@ -2205,11 +2210,13 @@ async function runQuery(
         UserPromptSubmit: [
           {
             hooks: [
-              createSessionRulesHook(),
-              // P5: per-repo manifest lookup — first-turn only, matches
-              // user prompt against agent-config.yaml's repo_routing and
-              // injects .clan/manifest.yaml context from the target repo.
-              createRepoManifestContextHook(),
+              // Spec-conformant fleet-hooks (session-rules + manifest-
+              // context) sourced from the canonical adapter — see
+              // src/fleet-hooks-adapter/index.ts and the fleet-hooks-spec
+              // behaviors + schemas for the cross-fleet contract.
+              ...composeFleetHooksUserPromptSubmit({
+                agentName: containerInput.assistantName,
+              }),
               // BANK retrieval — every turn, BM25 over shared
               // ~/.clan/learnings/bank.db. Records each injection into
               // injection-history for the correction-after-injection join.
@@ -2223,7 +2230,14 @@ async function runQuery(
           },
         ],
         SessionStart: [
-          { hooks: [createManifestContextHook(containerInput.assistantName)] },
+          {
+            hooks: [
+              createManifestContextHook(containerInput.assistantName),
+              ...composeFleetHooksSessionStart({
+                agentName: containerInput.assistantName,
+              }),
+            ],
+          },
         ],
         Stop: [
           {
@@ -2232,10 +2246,12 @@ async function runQuery(
               // Correction-detector finalisation — append assistant
               // response to corrections-raw + corrections.md (60s dedup).
               createCorrectionDetectorStopHook(containerInput.assistantName),
-              createLearningSyncHook(containerInput.assistantName),
-              createLearningVerifierHook(),
+              // Spec-conformant Stop hooks (learning-sync, learning-
+              // verifier, acp-metrics) sourced from the canonical adapter.
+              ...composeFleetHooksStop({
+                agentName: containerInput.assistantName,
+              }),
               createConvexEventHook(containerInput.assistantName),
-              createACPMetricsHook(containerInput.assistantName),
               // Circuit-breaker resume marker check — if
               // .resume-after-stuck is present, clear STUCK.flag + reset
               // the consecutive-failure counter.
