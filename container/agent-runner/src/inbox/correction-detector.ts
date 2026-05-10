@@ -26,6 +26,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import * as injectionHistory from './injection-history.js';
+import { validateOrWarn } from './spec-validator.js';
 
 interface CorrectionSignals {
   strong?: string[];
@@ -473,6 +474,7 @@ export function onUserPromptSubmit(
     assistant_response: null,
     pending_corr_id: corrId,
   };
+  validateOrWarn('correction-raw', rawRecord);
   appendJsonl(path.join(clanLearningsDir(), 'corrections-raw.jsonl'), rawRecord);
   _pendingRaw.set(sessionId, rawRecord);
 
