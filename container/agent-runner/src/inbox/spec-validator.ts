@@ -45,13 +45,15 @@ function tryLoadAjv(): any {
   if (_ajvAttempted) return _ajv;
   _ajvAttempted = true;
   try {
+    // Schemas declare $schema: draft 2020-12 — must import the 2020 entrypoint.
+    // The default `require('ajv')` only handles draft-07.
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Ajv = require('ajv');
-    _ajv = new Ajv({ allErrors: true, strict: false });
+    const Ajv2020 = require('ajv/dist/2020').default || require('ajv/dist/2020');
+    _ajv = new Ajv2020({ allErrors: true, strict: false });
   } catch {
     if (!_warnedUnavailable) {
       console.error(
-        '[spec-validator] ajv not installed — schema validation disabled. ' +
+        '[spec-validator] ajv (with 2020 draft) not available — schema validation disabled. ' +
           'Install with: npm install ajv',
       );
       _warnedUnavailable = true;
