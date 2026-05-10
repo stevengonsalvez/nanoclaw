@@ -516,8 +516,14 @@ function matchRepoFromPrompt(
   return bestRepo || routing.defaultRepo;
 }
 
-/** Locate a local checkout of <org>/<repo> by probing conventional paths. */
-function findLocalRepoPath(repoSlug: string): string | null {
+/**
+ * Locate a local checkout of <org>/<repo> by probing conventional paths.
+ * Returns {path, candidateIndex} so callers can record which candidate
+ * won (index 4 is the NanoClaw-only agents-in-a-box layout per spec).
+ */
+function findLocalRepoPath(
+  repoSlug: string,
+): { path: string; candidateIndex: number } | null {
   if (!repoSlug) return null;
   const home = process.env.HOME || '';
   const leaf = repoSlug.split('/').pop() || '';
@@ -529,9 +535,12 @@ function findLocalRepoPath(repoSlug: string): string | null {
     path.join(home, leaf),
     path.join(home, '.agents-in-a-box', 'repos', 'github.com', ...repoSlug.toLowerCase().split('/')),
   ];
-  for (const p of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const p = candidates[i];
     try {
-      if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return p;
+      if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+        return { path: p, candidateIndex: i };
+      }
     } catch {
       /* ignore */
     }
@@ -544,29 +553,42 @@ function findLocalRepoPath(repoSlug: string): string | null {
  * files based on task_type. Returns a single injectable context blob, or
  * empty string when the manifest (and AGENTS.md fallback) are missing.
  */
+interface ManifestContextResult {
+  context: string;
+  source: 'manifest' | 'agents-md' | 'none';
+  filesLoaded: string[];
+  manifestPath?: string;
+  agentsMdPath?: string;
+}
+
 function loadRepoManifestContext(
   repoDir: string,
   taskType: 'test' | 'review' | 'ops' | 'build',
-): string {
+): ManifestContextResult {
   const manifestPath = path.join(repoDir, '.clan', 'manifest.yaml');
   if (!fs.existsSync(manifestPath)) {
     const agentsMd = path.join(repoDir, 'AGENTS.md');
     if (fs.existsSync(agentsMd)) {
       try {
         const content = fs.readFileSync(agentsMd, 'utf-8').slice(0, 5000);
-        return `## Repo Context (AGENTS.md fallback) — ${path.basename(repoDir)}\n\n${content}`;
+        return {
+          context: `## Repo Context (AGENTS.md fallback) — ${path.basename(repoDir)}\n\n${content}`,
+          source: 'agents-md',
+          filesLoaded: [],
+          agentsMdPath: agentsMd,
+        };
       } catch {
-        return '';
+        return { context: '', source: 'none', filesLoaded: [] };
       }
     }
-    return '';
+    return { context: '', source: 'none', filesLoaded: [] };
   }
 
   let manifestRaw: string;
   try {
     manifestRaw = fs.readFileSync(manifestPath, 'utf-8');
   } catch {
-    return '';
+    return { context: '', source: 'none', filesLoaded: [], manifestPath };
   }
 
   // Extract context.always and context.<taskType> file lists. The manifest
@@ -625,9 +647,16 @@ function loadRepoManifestContext(
       /* skip unreadable */
     }
   }
-  if (loaded.length === 0) return '';
+  if (loaded.length === 0) {
+    return { context: '', source: 'none', filesLoaded: [], manifestPath };
+  }
   parts.splice(3, 0, `## Files loaded: ${loaded.join(', ')}`);
-  return parts.join('\n');
+  return {
+    context: parts.join('\n'),
+    source: 'manifest',
+    filesLoaded: loaded,
+    manifestPath,
+  };
 }
 
 /**
@@ -658,18 +687,40 @@ function createRepoManifestContextHook(): HookCallback {
     const repoSlug = matchRepoFromPrompt(prompt, routing);
     if (!repoSlug) return {};
 
-    const repoDir = findLocalRepoPath(repoSlug);
-    if (!repoDir) return {};
+    const repoMatch = findLocalRepoPath(repoSlug);
+    if (!repoMatch) return {};
 
     const taskType = detectTaskType(prompt);
-    const context = loadRepoManifestContext(repoDir, taskType);
-    if (!context) return {};
+    const result = loadRepoManifestContext(repoMatch.path, taskType);
 
-    log(`Repo-manifest: injected ${taskType} context for ${repoSlug} from ${repoDir}`);
+    // Build + validate manifest-context-injection record per
+    // fleet-hooks-spec/schemas/manifest-context-injection.schema.json.
+    // Ephemeral observability — warn-only default.
+    const record: Record<string, unknown> = {
+      is_first_turn: true,
+      task_type: taskType,
+      repo_slug: repoSlug,
+      repo_path: repoMatch.path,
+      source: result.source,
+      context_chars: result.context.length,
+      candidate_index: repoMatch.candidateIndex,
+    };
+    if (result.source === 'manifest' && result.manifestPath) {
+      record.manifest_path = result.manifestPath;
+      if (result.filesLoaded.length > 0) record.files_loaded = result.filesLoaded;
+    } else if (result.source === 'agents-md' && result.agentsMdPath) {
+      record.agents_md_path = result.agentsMdPath;
+    }
+    if (sessionId) record.session_id = sessionId;
+    validateOrWarn('manifest-context-injection', record);
+
+    if (!result.context) return {};
+
+    log(`Repo-manifest: injected ${taskType} context for ${repoSlug} from ${repoMatch.path}`);
     return {
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit' as const,
-        additionalContext: context,
+        additionalContext: result.context,
       },
     };
   };
