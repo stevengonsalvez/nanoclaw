@@ -1,0 +1,33 @@
+name: fleet-hooks-adapter
+version: 1.0.0
+description: "NanoClaw canonical implementation of fleet-hooks-spec — UserPromptSubmit/Stop/SessionStart handlers delegating to spec-driven logic"
+author: Fleet Lambda
+spec_version: 1
+spec_source: "../../../hermes-fleet-backup/plugins/fleet-hooks-spec"
+provides_hooks:
+  - UserPromptSubmit
+  - Stop
+  - SessionStart
+spec_hooks:
+  - name: session-rules
+    sdk_event: UserPromptSubmit
+    behavior: fleet-hooks-spec/behaviors/session-rules.md
+    schemas: [standing-orders-injection]
+  - name: manifest-context
+    sdk_event: UserPromptSubmit
+    behavior: fleet-hooks-spec/behaviors/manifest-context.md
+    schemas: [manifest-context-injection]
+  - name: learning-sync
+    sdk_event: Stop
+    behavior: fleet-hooks-spec/behaviors/learning-sync.md
+    schemas: [pattern, learning-sync-state, strike]
+  - name: learning-verifier
+    sdk_event: Stop
+    behavior: fleet-hooks-spec/behaviors/learning-verifier.md
+    schemas: [missed-learning, strike]
+  - name: acp-metrics
+    sdk_event: Stop
+    behavior: fleet-hooks-spec/behaviors/acp-metrics.md
+    schemas: [acp-metric]
+runtime_module: container/agent-runner/src/fleet-hooks-adapter/index.ts
+strictness_env: FLEET_HOOKS_SPEC_STRICT
