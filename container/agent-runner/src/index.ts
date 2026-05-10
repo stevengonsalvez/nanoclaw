@@ -42,6 +42,8 @@ import { validateOrWarn } from './inbox/spec-validator.js';
 import {
   computeSignature,
   readLatestRawForSession,
+  readRecentRawForSession,
+  buildStrikeIndex,
 } from './inbox/learning-fingerprint.js';
 import {
   queryBank,
@@ -1080,6 +1082,35 @@ function createInboxEnforcerHook(platform?: string, agentName?: string): HookCal
  * Tracks last sync position to avoid re-appending.
  */
 /**
+ * Append a strike row per fleet-hooks-spec/schemas/strike.schema.json.
+ * Per Layer 3 of the dedup contract: strikes count every gripe occurrence
+ * (called BEFORE pattern dedup-on-append), not every unique pattern.
+ */
+function emitStrike(
+  strikesPath: string,
+  signature: string,
+  agent: string,
+  title: string,
+): void {
+  const record = {
+    ts: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    signature,
+    agent,
+    title: title.slice(0, 200),
+  };
+  validateOrWarn('strike', record);
+  try {
+    const dir = path.dirname(strikesPath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(strikesPath, JSON.stringify(record) + '\n');
+  } catch (err) {
+    console.error(
+      `[learning-sync] strike write failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/**
  * Layer-2 dedup-on-append per fleet-hooks-spec/behaviors/learning-sync.md:
  * read the last 50 patterns.jsonl rows; skip append if any has matching
  * signature. Substring fuzz on title/problem is explicitly forbidden.
@@ -1120,6 +1151,10 @@ function createLearningSyncHook(agentName?: string): HookCallback {
     const correctionsRawPath = path.join(
       process.env.CLAN_LEARNINGS_DIR || path.join(process.env.HOME || '~', '.clan', 'learnings'),
       'corrections-raw.jsonl',
+    );
+    const strikesPath = path.join(
+      process.env.CLAN_LEARNINGS_DIR || path.join(process.env.HOME || '~', '.clan', 'learnings'),
+      'strikes.jsonl',
     );
 
     if (!fs.existsSync(correctionsPath)) return {};
@@ -1184,6 +1219,11 @@ function createLearningSyncHook(agentName?: string): HookCallback {
         problem,
       });
 
+      // Layer 3 (strike record): emit BEFORE dedup so every gripe is counted,
+      // not every unique pattern. Drives missed-learning detection in
+      // createLearningVerifierHook via signature-collision against the ledger.
+      emitStrike(strikesPath, signature, agentName || 'unknown', trimmedTitle);
+
       // Layer-2 dedup-on-append: skip if signature already in the last 50 rows.
       // Layer 1 (idempotencyKey) is still recorded so we don't re-process.
       if (isDuplicateSignature(patternsPath, signature)) {
@@ -1234,81 +1274,87 @@ function createLearningSyncHook(agentName?: string): HookCallback {
 }
 
 /**
- * Stop hook: check if the agent missed a known pattern from the shared
- * learnings store. Scans the last assistant message for keywords that
- * match patterns in patterns.jsonl but weren't applied.
+ * Stop hook: detect missed-learnings via signature collision against the
+ * strikes ledger. See fleet-hooks-spec/behaviors/learning-verifier.md.
+ *
+ * Algorithm:
+ *   1. read recent FINALIZED corrections-raw entries for this session
+ *      within MAX_AGE_SEC=300 (Hermes-canonical bound)
+ *   2. build strike index from ~/.clan/learnings/strikes.jsonl
+ *   3. for each recent raw: compute signature; if signature exists in
+ *      strikes ledger AND prior strike's ts is more than 5s older than
+ *      this raw's ts, emit a missed-learning row
+ *
+ * Keyword-overlap is explicitly forbidden by the spec — it produced 0
+ * hits in 14 days in the Hermes Pass-3 audit and has high false-positive
+ * surface.
  */
 function createLearningVerifierHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
     const evt = input as StopHookInput;
-    const message = evt.last_assistant_message;
-    if (!message) return {};
+    const sessionId = evt.session_id || '';
+    if (!sessionId) return {};
 
-    const patternsPath = path.join(
-      process.env.HOME || '~',
-      '.clan',
-      'learnings',
-      'patterns.jsonl',
+    const correctionsRawPath = path.join(
+      process.env.CLAN_LEARNINGS_DIR ||
+        path.join(process.env.HOME || '~', '.clan', 'learnings'),
+      'corrections-raw.jsonl',
     );
-    if (!fs.existsSync(patternsPath)) return {};
-
-    let patterns: Array<{
-      id: string;
-      title: string;
-      problem: string;
-      solution: string;
-      tags?: string[];
-    }>;
-    try {
-      patterns = fs
-        .readFileSync(patternsPath, 'utf-8')
-        .split('\n')
-        .filter((line) => line.trim())
-        .map((line) => JSON.parse(line))
-        .filter((p) => p.status === 'active');
-    } catch {
-      return {};
-    }
-
-    if (patterns.length === 0) return {};
-
-    // Extract keywords from message (words 4+ chars, lowered)
-    const messageWords = new Set(
-      message
-        .toLowerCase()
-        .split(/\W+/)
-        .filter((w) => w.length >= 4),
+    const strikesPath = path.join(
+      process.env.CLAN_LEARNINGS_DIR ||
+        path.join(process.env.HOME || '~', '.clan', 'learnings'),
+      'strikes.jsonl',
     );
+    const missedPath = `${WORKSPACE_GROUP}/self-improving/missed-learnings.jsonl`;
 
-    // Check each pattern for keyword overlap (2+ matching keywords)
-    const missedPatterns: string[] = [];
-    for (const pattern of patterns) {
-      const patternWords = [
-        ...(pattern.problem || '').toLowerCase().split(/\W+/),
-        ...(pattern.tags || []).map((t) => t.toLowerCase()),
-      ].filter((w) => w.length >= 4);
+    const recent = readRecentRawForSession(sessionId, correctionsRawPath, fs, 300);
+    if (recent.length === 0) return {};
 
-      const overlap = patternWords.filter((w) => messageWords.has(w));
-      if (overlap.length >= 2) {
-        missedPatterns.push(pattern.id);
+    const strikeIndex = buildStrikeIndex(strikesPath, fs);
+    if (strikeIndex.size === 0) return {};
+
+    const dir = path.dirname(missedPath);
+    fs.mkdirSync(dir, { recursive: true });
+
+    let written = 0;
+    for (const raw of recent) {
+      const sig = computeSignature({
+        userMessage: raw.user_message,
+        matchedSignals: raw.matched_signals,
+      });
+      const prior = strikeIndex.get(sig);
+      if (!prior) continue;
+
+      // Skip when the only known strike IS this correction (timestamps
+      // within 5s) — the Layer 3 emission for this same gripe ran a
+      // moment ago in the same Stop pass.
+      const priorMs = Date.parse(prior.ts || '');
+      const thisMs = Date.parse(raw.ts || '');
+      if (
+        !Number.isNaN(priorMs) &&
+        !Number.isNaN(thisMs) &&
+        Math.abs(priorMs - thisMs) < 5000
+      ) {
+        continue;
       }
-    }
-
-    if (missedPatterns.length > 0) {
-      const missedPath = `${WORKSPACE_GROUP}/self-improving/missed-learnings.jsonl`;
-      const dir = path.dirname(missedPath);
-      fs.mkdirSync(dir, { recursive: true });
 
       const entry = {
-        ts: new Date().toISOString(),
-        sessionId: evt.session_id,
-        matchedPatterns: missedPatterns,
-        messagePreview: message.slice(0, 200),
+        id: `ml-${Date.now()}-${written}`,
+        timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+        session_id: sessionId,
+        signature: sig,
+        raw_correction_id: raw.id,
+        matched_signals: raw.matched_signals || [],
+        first_seen: prior.ts,
+        first_seen_title: prior.title || '',
+        message: 'Agent had this trigger fingerprint stored but failed to apply',
       };
+      validateOrWarn('missed-learning', entry);
       fs.appendFileSync(missedPath, JSON.stringify(entry) + '\n');
+      written++;
 
       log(
-        `Learning-verifier: ${missedPatterns.length} potentially missed pattern(s)`,
+        `Learning-verifier: MISSED LEARNING sig=${sig} session=${sessionId.slice(0, 8)} (first seen ${prior.ts || '?'})`,
       );
     }
 
