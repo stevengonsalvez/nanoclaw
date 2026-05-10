@@ -145,3 +145,90 @@ export function readLatestRawForSession(
     return null;
   }
 }
+
+export interface RawCorrectionEntry {
+  id?: string;
+  ts?: string;
+  session_id?: string;
+  user_message?: string;
+  matched_signals?: string[];
+  assistant_response?: string | null;
+}
+
+/**
+ * Read FINALIZED recent corrections-raw entries for `sessionId` within
+ * `maxAgeSec` (canonical: 300, matching Hermes _read_recent_raw).
+ *
+ * "Finalized" means assistant_response is non-null — armed-only entries
+ * are skipped because we'll see the finalized pair on the next call.
+ *
+ * Tail-reads last 500 lines.
+ */
+export function readRecentRawForSession(
+  sessionId: string,
+  rawPath: string,
+  fs: typeof import('fs'),
+  maxAgeSec = 300,
+): RawCorrectionEntry[] {
+  if (!sessionId || !fs.existsSync(rawPath)) return [];
+  const cutoffMs = Date.now() - maxAgeSec * 1000;
+  try {
+    const lines = fs.readFileSync(rawPath, 'utf-8').split('\n');
+    const out: RawCorrectionEntry[] = [];
+    for (const raw of lines.slice(-500)) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const entry: RawCorrectionEntry = JSON.parse(line);
+        if (entry.session_id !== sessionId) continue;
+        if (entry.assistant_response == null) continue;
+        const t = Date.parse(entry.ts || '');
+        if (Number.isNaN(t)) continue;
+        if (t < cutoffMs) continue;
+        out.push(entry);
+      } catch {
+        /* ignore */
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export interface StrikeEntry {
+  ts?: string;
+  signature?: string;
+  agent?: string;
+  title?: string;
+}
+
+/**
+ * Build a lookup signature -> first-seen strike row, mirroring Hermes
+ * _build_known_signature_index. Reads ~/.clan/learnings/strikes.jsonl.
+ * Empty map if the file is missing.
+ */
+export function buildStrikeIndex(
+  strikesPath: string,
+  fs: typeof import('fs'),
+): Map<string, StrikeEntry> {
+  const out = new Map<string, StrikeEntry>();
+  if (!fs.existsSync(strikesPath)) return out;
+  try {
+    const lines = fs.readFileSync(strikesPath, 'utf-8').split('\n');
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const entry: StrikeEntry = JSON.parse(line);
+        const sig = entry.signature;
+        if (sig && !out.has(sig)) out.set(sig, entry);
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
