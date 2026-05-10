@@ -38,6 +38,7 @@ import { readRecentDiscoveries } from './inbox/discoveries.js';
 import * as circuitBreaker from './inbox/circuit-breaker.js';
 import * as correctionDetector from './inbox/correction-detector.js';
 import * as injectionHistory from './inbox/injection-history.js';
+import { validateOrWarn } from './inbox/spec-validator.js';
 import {
   queryBank,
   extractKeywords,
@@ -890,14 +891,17 @@ function createInboxEnforcerHook(platform?: string, agentName?: string): HookCal
     const payloadViolations = validateInboxPayloads(message);
     for (const detail of payloadViolations) {
       const violation = {
-        ts: new Date().toISOString(),
+        id: `viol-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        session_id: evt.session_id,
         agent: agentName || 'unknown',
-        sessionId: evt.session_id,
-        messagePreview: message.slice(0, 300),
-        type: 'invalid-inbox-payload',
-        detail,
         platform: plat || 'unknown',
+        rule: 'invalid-inbox-payload',
+        violation_type: 'inbox_enforcer',
+        detail,
+        message_preview: message.slice(0, 300),
       };
+      validateOrWarn('violation', violation);
       const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
       fs.mkdirSync(path.dirname(violationsPath), { recursive: true });
       fs.appendFileSync(violationsPath, JSON.stringify(violation) + '\n');
@@ -933,14 +937,17 @@ function createInboxEnforcerHook(platform?: string, agentName?: string): HookCal
 
     if (mentions && mentions.length > 0 && !inboxPattern.test(message)) {
       const violation = {
-        ts: new Date().toISOString(),
+        id: `viol-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        session_id: evt.session_id,
         agent: agentName || 'unknown',
-        sessionId: evt.session_id,
-        mentions: mentions,
-        messagePreview: message.slice(0, 200),
-        type: 'orphan-mention',
         platform: plat || 'unknown',
+        rule: 'orphan-mention',
+        violation_type: 'inbox_enforcer',
+        message_preview: message.slice(0, 200),
+        mentions: mentions,
       };
+      validateOrWarn('violation', violation);
 
       const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
       const dir = path.dirname(violationsPath);
@@ -998,14 +1005,17 @@ function createInboxEnforcerHook(platform?: string, agentName?: string): HookCal
 
       if (missing.length > 0) {
         const violation = {
-          ts: new Date().toISOString(),
+          id: `viol-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          session_id: evt.session_id,
           agent: agentName || 'unknown',
-          sessionId: evt.session_id,
-          messagePreview: message.slice(0, 300),
-          type: 'incomplete-inbox-content',
-          missingFields: missing,
           platform: plat || 'unknown',
+          rule: 'incomplete-inbox-content',
+          violation_type: 'inbox_enforcer',
+          message_preview: message.slice(0, 300),
+          missing_fields: missing,
         };
+        validateOrWarn('violation', violation);
         const violationsPath = `${WORKSPACE_GROUP}/self-improving/violations.jsonl`;
         const dir = path.dirname(violationsPath);
         fs.mkdirSync(dir, { recursive: true });
