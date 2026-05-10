@@ -218,7 +218,7 @@ export interface ACPMetrics {
   estimatedTokens?: number;
   loopsDetected: number;
   humanInterventions: number;
-  outcome: 'resolved' | 'handed-off' | 'abandoned' | 'unknown';
+  outcome: 'resolved' | 'handed-off' | 'abandoned';
   project?: string;
   clan?: string;
   harness?: string;

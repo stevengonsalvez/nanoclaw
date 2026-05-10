@@ -1528,6 +1528,10 @@ function createACPMetricsHook(agentName?: string): HookCallback {
       ts: new Date().toISOString(),
     };
 
+    // Validate per fleet-hooks-spec/schemas/acp-metric.schema.json.
+    // Warn-only default; FLEET_HOOKS_SPEC_STRICT=1 enforces.
+    validateOrWarn('acp-metric', metric);
+
     // Persist locally to shared clan store
     try {
       const metricsPath = path.join(
