@@ -249,6 +249,8 @@ let _fullStandingOrders = '';
 let _condensedStandingOrders = '';
 let _standingOrdersLoaded = false;
 let _seenSessions = new Set<string>();
+let _resolvedSourcePath = ''; // candidate-fallback resolution result (spec contract)
+let _fallbackUsed = false; // true if first candidate was missing
 
 function loadStandingOrders(): void {
   if (_standingOrdersLoaded) return;
@@ -260,9 +262,12 @@ function loadStandingOrders(): void {
     `${WORKSPACE_GLOBAL}/CLAUDE.md`,
   ];
   let content = '';
-  for (const p of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const p = candidates[i];
     if (fs.existsSync(p)) {
       content = fs.readFileSync(p, 'utf-8');
+      _resolvedSourcePath = p;
+      _fallbackUsed = i > 0;
       break;
     }
   }
@@ -306,26 +311,61 @@ function createSessionRulesHook(): HookCallback {
     const evt = input as UserPromptSubmitHookInput;
     loadStandingOrders();
 
-    if (!_fullStandingOrders) return {};
-
     const sessionId = evt.session_id;
     const isFirstTurn = !_seenSessions.has(sessionId);
+
+    // Build + validate the standing-orders-injection record (spec contract).
+    // Record is ephemeral — warn-only by default, strict on FLEET_HOOKS_SPEC_STRICT=1.
+    const emitRecord = (
+      mode: 'full' | 'condensed' | 'empty',
+      body: string,
+      extras: string[],
+    ): void => {
+      const record: Record<string, unknown> = {
+        mode,
+        is_first_turn: isFirstTurn,
+        content_chars: body.length,
+      };
+      if (mode === 'condensed') {
+        record.critical_rules = [...CONDENSED_RULE_PREFIXES];
+      }
+      if (_resolvedSourcePath) record.source_path = _resolvedSourcePath;
+      if (_fallbackUsed) record.fallback_used = true;
+      if (sessionId) record.session_id = sessionId;
+      if (extras.length > 0) record.extras_injected = extras;
+      validateOrWarn('standing-orders-injection', record);
+    };
+
+    if (!_fullStandingOrders) {
+      emitRecord('empty', '', []);
+      if (isFirstTurn) _seenSessions.add(sessionId);
+      return {};
+    }
+
     if (isFirstTurn) _seenSessions.add(sessionId);
 
     const parts: string[] = [];
+    const extras: string[] = [];
+    let body = '';
+    let mode: 'full' | 'condensed' = 'full';
     if (isFirstTurn) {
-      parts.push('[FLEET-RULES — full load]\n\n' + _fullStandingOrders);
+      body = _fullStandingOrders;
+      parts.push('[FLEET-RULES — full load]\n\n' + body);
 
       // Include agent-config.yaml once on first turn for routing context
       const agentConfigPath = `${WORKSPACE_GROUP}/agent-config.yaml`;
       if (fs.existsSync(agentConfigPath)) {
         const config = fs.readFileSync(agentConfigPath, 'utf-8');
         parts.push('# Agent Config (routing reference)\n```yaml\n' + config + '\n```');
+        extras.push('agent-config');
       }
     } else {
-      parts.push('[FLEET-RULES — condensed]\n\n' + _condensedStandingOrders);
+      mode = 'condensed';
+      body = _condensedStandingOrders;
+      parts.push('[FLEET-RULES — condensed]\n\n' + body);
     }
 
+    emitRecord(mode, body, extras);
     log(
       `Session-rules: ${isFirstTurn ? 'full' : 'condensed'} injection (session ${sessionId.slice(0, 8)})`,
     );
