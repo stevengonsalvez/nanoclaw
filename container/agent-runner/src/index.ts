@@ -40,6 +40,10 @@ import * as correctionDetector from './inbox/correction-detector.js';
 import * as injectionHistory from './inbox/injection-history.js';
 import { validateOrWarn } from './inbox/spec-validator.js';
 import {
+  computeSignature,
+  readLatestRawForSession,
+} from './inbox/learning-fingerprint.js';
+import {
   queryBank,
   extractKeywords,
   formatBankContext,
@@ -1075,8 +1079,36 @@ function createInboxEnforcerHook(platform?: string, agentName?: string): HookCal
  * to the shared clan learnings store (~/.clan/learnings/patterns.jsonl).
  * Tracks last sync position to avoid re-appending.
  */
+/**
+ * Layer-2 dedup-on-append per fleet-hooks-spec/behaviors/learning-sync.md:
+ * read the last 50 patterns.jsonl rows; skip append if any has matching
+ * signature. Substring fuzz on title/problem is explicitly forbidden.
+ */
+function isDuplicateSignature(patternsPath: string, signature: string): boolean {
+  if (!signature || !fs.existsSync(patternsPath)) return false;
+  try {
+    const lines = fs.readFileSync(patternsPath, 'utf-8').split('\n');
+    const tail = lines.slice(-50);
+    for (const raw of tail) {
+      const line = raw.trim();
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.signature === signature) return true;
+      } catch {
+        /* ignore malformed lines */
+      }
+    }
+  } catch {
+    /* ignore read errors */
+  }
+  return false;
+}
+
 function createLearningSyncHook(agentName?: string): HookCallback {
-  return async (_input, _toolUseId, _context) => {
+  return async (input, _toolUseId, _context) => {
+    const evt = input as StopHookInput;
+    const sessionId = evt.session_id || '';
     const correctionsPath = `${WORKSPACE_GROUP}/self-improving/corrections.md`;
     const syncStatePath = `${WORKSPACE_GROUP}/self-improving/.learning-sync-state.json`;
     const patternsPath = path.join(
@@ -1084,6 +1116,10 @@ function createLearningSyncHook(agentName?: string): HookCallback {
       '.clan',
       'learnings',
       'patterns.jsonl',
+    );
+    const correctionsRawPath = path.join(
+      process.env.CLAN_LEARNINGS_DIR || path.join(process.env.HOME || '~', '.clan', 'learnings'),
+      'corrections-raw.jsonl',
     );
 
     if (!fs.existsSync(correctionsPath)) return {};
@@ -1111,12 +1147,19 @@ function createLearningSyncHook(agentName?: string): HookCallback {
     const patternsDir = path.dirname(patternsPath);
     fs.mkdirSync(patternsDir, { recursive: true });
 
+    // Look up the most-recent corrections-raw row for this session ONCE —
+    // every correction parsed from corrections.md in this run shares it
+    // (matching Hermes's per-run lookup pattern). When raw audit data is
+    // missing, computeSignature falls back to L-prefixed legacy hash.
+    const raw = readLatestRawForSession(sessionId, correctionsRawPath, fs);
+
     let appended = 0;
+    let skippedBySignature = 0;
     let match: RegExpExecArray | null;
     while ((match = entryRegex.exec(content)) !== null) {
       const [, ts, title, body] = match;
-      const key = `${ts}::${title.trim().slice(0, 80)}`;
-      if (syncedKeys.has(key)) continue;
+      const idempotencyKey = `${ts}::${title.trim().slice(0, 80)}`;
+      if (syncedKeys.has(idempotencyKey)) continue;
 
       // Extract body fields
       const gotWrong = body.match(/\*\*What I got wrong:\*\*\s*(.+)/)?.[1]?.trim();
@@ -1130,42 +1173,61 @@ function createLearningSyncHook(agentName?: string): HookCallback {
 
       const problem = gotWrong || signalContent || title.trim();
       const solution = correctApproach || patternDesc || 'See corrections.md for details';
+      const trimmedTitle = title.trim().slice(0, 120);
+
+      // Layer-2 signature per spec: trigger fingerprint when raw available,
+      // L-prefixed legacy fallback otherwise. Hermes-byte-compatible.
+      const signature = computeSignature({
+        userMessage: raw?.user_message,
+        matchedSignals: raw?.matched_signals,
+        title: trimmedTitle,
+        problem,
+      });
+
+      // Layer-2 dedup-on-append: skip if signature already in the last 50 rows.
+      // Layer 1 (idempotencyKey) is still recorded so we don't re-process.
+      if (isDuplicateSignature(patternsPath, signature)) {
+        syncedKeys.add(idempotencyKey);
+        skippedBySignature++;
+        continue;
+      }
 
       const pattern = {
         id: `p-${agentName || 'unknown'}-${Date.now()}-${appended}`,
         uuid: crypto.randomUUID(),
         agent: agentName || 'unknown',
-        harness: 'nanoclaw',
+        harness: 'nanoclaw' as const,
         clan: 'lambda',
         ts: new Date().toISOString(),
         source_ts: ts,
         category: 'correction',
-        title: title.trim().slice(0, 120),
+        title: trimmedTitle,
         problem: problem.slice(0, 500),
         solution: solution.slice(0, 500),
         tags: tier ? ['auto-detected', `tier:${tier}`, `source:${source}`] : ['manual', `source:${source}`],
-        status: 'active',
+        status: 'active' as const,
         supersedes: null,
+        signature,
       };
+      validateOrWarn('pattern', pattern);
       fs.appendFileSync(patternsPath, JSON.stringify(pattern) + '\n');
-      syncedKeys.add(key);
+      syncedKeys.add(idempotencyKey);
       appended++;
     }
 
-    if (appended > 0) {
+    if (appended > 0 || skippedBySignature > 0) {
       log(
-        `Learning-sync: appended ${appended} pattern(s) to patterns.jsonl`,
+        `Learning-sync: appended ${appended} pattern(s), skipped ${skippedBySignature} by signature dedup`,
       );
     }
 
-    // Update sync state
-    fs.writeFileSync(
-      syncStatePath,
-      JSON.stringify({
-        lastMtime: stat.mtimeMs,
-        syncedKeys: Array.from(syncedKeys),
-      }) + '\n',
-    );
+    // Update sync state — validated against learning-sync-state schema.
+    const stateRecord = {
+      lastMtime: stat.mtimeMs,
+      syncedKeys: Array.from(syncedKeys),
+    };
+    validateOrWarn('learning-sync-state', stateRecord);
+    fs.writeFileSync(syncStatePath, JSON.stringify(stateRecord) + '\n');
 
     return {};
   };
